@@ -92,11 +92,13 @@ online-mode={input("Online mode? (true or false): ")}
 rcon.password={sha256(bytes(str(id(port) * id(motd)), 'utf-8')).hexdigest()}
 rcon.port={port + 1}
 server-port={port}
-enable-rcon=true""")
+enable-rcon=true
+enforce-secure-profile=false""")
 
 if "start.sh" not in os.listdir():
     ram = input("Amount of RAM (e.g. 1024M or 1G): ")
     with open("start.bat" if os.name == 'nt' else "start.sh", "x") as f:
         f.write(f"java -Xmx{ram} -Xms{ram} -server -jar fabric.jar nogui")
         
+
 print("Configuration options are set! Run the start file to start the server!")
