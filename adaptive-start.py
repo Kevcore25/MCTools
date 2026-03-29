@@ -1,22 +1,64 @@
 #!/usr/bin/env python3
 
+VERSION = '2.0.0'
+
+"""
+Minecraft Adaptive Server Starter (MASS)!
+
+This is a script/program that will start a Minecraft server if a player tries to join,
+or stops a Minecraft server if no players are online within a set period.
+
+Now has RAM/SWAP requirements to start!
+
+HOW TO USE:
+Just put this file in an already started Minecraft server directory and it'll 
+automatically adjust its config values!
+Run the program and then ensure the config is accurate and suited for your needs.
+Then, simply run this program forever and it'll automatically start the server!
+"""
+
+"""
+Version updates:
+
+2.0:
+- Improved killing process: now has RCON and PID killing systems and better auto stop stability
+- AutoConfig (automatically configs the file based on server.properties and start.sh files)
+- Memory requirements (needs X amount of memory to start)
+- Config reloader detection 
+- Startup timeout
+- Auto-updater
+
+1.0:
+- Created this script
+"""
+
+
 import asyncio
 import base64
+import os
 import json
 import logging
+import requests
 import struct
 import time
 from pathlib import Path
-import threading
+import psutil
+
 
 log = logging.getLogger("ServerStarter")
 
+CONFIG_FILENAME = "mass-config.json"
+
+STARTUP_TIMES_FILE = "startup_times.json"
+MAX_STORED_TIMES = 10
 
 """
-CONFIG
+DEFAULT CONFIG
 
 Note that below is the default config. 
-When the program starts, a config.json will be made and you can change things from there
+When the program starts, a config.json will be made and you can change things from there.
+
+TL;DR Don't change the default config below!!
 """
 DEFAULT_CONFIG = {
     # Proxy ports
@@ -28,7 +70,15 @@ DEFAULT_CONFIG = {
     # Start command (e.g. sh start.sh). You probably shouldn't use nohup here and rather nohup this python script instead
     "start_command": "java -Xmx4G -server -jar server.jar nogui",
 
+    # Amount of RAM/SWAP required (in GB) to start the program - if it is too low then the server won't start
+    # If set to None/null/0 then this is ignored
+    "ram_required": 4.5,
+    "swap_required": None,
+    # Message to kick if no memory
+    "kick_message_no_memory": "\u00A74The physical server does not have enough memory to wake the Minecraft server!\n\n\u00A74This issue should be reported to the administrators.",
+
     # Messages for starting/offline
+    # {{ESTIMATED_TIME_REMAINING}} and {{ESTIMATED_TIME}} are available placeholders
     "kick_message": "\u00A7eThis server is waking up...\u00A7r\n\n\u00A7bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}",
     "offline_motd": "\u00A74This server is sleeping.\u00A7r\n\u00A7aJoin it to wake it! ({{ESTIMATED_TIME}})",
     "starting_motd": "\u00A7eThis server is waking up...\u00A7r\n\u00A7bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}",
@@ -38,16 +88,108 @@ DEFAULT_CONFIG = {
     # Duration of empty players (in min) before the stop cmd is ran
     "auto_stop_empty_minutes": 2,
 
+    # Max time (in seconds) to wait for the server to start before killing it. None = no timeout
+    "startup_timeout": 300,
+
     # Polling intervals - default should be fine
     "poll_interval": 0.5,
     "auto_stop_poll_interval": 3,
 
     # Default icons made with basic shapes in Google Drawings
     "offline_icon": None,
-    "starting_icon": None
+    "starting_icon": None,
+
+    # Whether the starter should check for updates and download them automatically
+    # For security/stabiliy this should be disabled but this is enabled by default as the project is pretty small and in development
+    "auto_update": True,
+    "auto_update_urls": [
+        'https://raw.githubusercontent.com/Kevcore25/MCTools/refs/heads/main/adaptive-start.py', # Official GitHub server
+        'https://kaf.kcservers.ca/releases/mass.py' # Private server which may receive more frequent updates - can be removed 
+    ]
 }
 
 
+
+def compareVersion(version1: str, version2: str) -> int:
+    v1 = list(map(int, version1.split('.')))
+    v2 = list(map(int, version2.split('.')))
+    n = max(len(v1), len(v2))
+    
+    for i in range(n):
+        num1 = v1[i] if i < len(v1) else 0
+        num2 = v2[i] if i < len(v2) else 0
+        if num1 < num2:
+            return False
+        if num1 > num2:
+            return True
+    return False
+
+def updater(config: dict[str, list[str]]):
+
+    log.info("Checking for updates...")
+
+    for i, url in enumerate(config["auto_update_urls"], start=1):
+        try:
+            r = requests.get(url, timeout=1)
+
+            # Check status
+            if r.status_code != 200:
+                raise Exception(f"Returned status code {r.status_code}")
+            
+            # Get version
+            version = r.text.splitlines()[0].split('=', 1)[1].strip().strip("'").strip('"')
+            log.info(f"Found server #{i} with version {version} (Current version {VERSION})")
+
+            if compareVersion(version, VERSION):
+                with open(os.path.abspath(__file__), 'wb') as f:
+                    f.write(r.content)
+
+                log.info("Current Minecraft Adaptive Server Starter is updated!")
+                break
+        except IndexError:
+            log.error(f"Unable to fetch server #{i} due to invalid format")
+        except (ConnectionError, requests.ConnectTimeout):
+            log.error(f"Unable to fetch server #{i} due to a connection error")
+        except Exception as e:
+            log.error(f"Unable to fetch server #{i}: {e}")
+    else:
+        log.info("The updater did not update the file")
+
+def create_config(config_path: str = CONFIG_FILENAME):
+    config = DEFAULT_CONFIG.copy()
+
+    # Server.properties
+    if Path("server.properties").exists():
+        with open("server.properties", 'r') as f:
+            props = f.readlines()
+
+        # Change server-port to +1 if it exists and set the proxy port to it instead
+        for i, ln in enumerate(props):
+            if ln.startswith('#') or ln.isspace() or ln == '': 
+                continue
+            
+            k, v = ln.rstrip('\n').split('=')
+
+            if k == "server-port":
+                v = int(v)
+                config["listen_port"] = v
+                props[i] = f"server-port={v+1}\n"
+                with open("server.properties", 'w') as f:
+                    f.writelines(props)
+                log.info(f"The server port is switched from {v} to {v+1} and the proxy server's port is set to {v}")
+                break
+
+    # bash start.sh
+    if Path("start.sh").exists():
+        config["start_command"] = "bash start.sh"
+
+
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+    log.info(f"Created default config at {config_path}")
+    return config
+    
 # =============================================================================
 # Protocol Primitives
 # =============================================================================
@@ -122,10 +264,58 @@ async def read_packet(reader: asyncio.StreamReader) -> tuple[int, bytes]:
     packet_id, offset = decode_varint(data)
     return packet_id, data[offset:]
 
+async def rcon_send(host: str, port: int, password: str, command: str) -> str | None:
+    """Connect to RCON, authenticate, send a command, and return the response."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=5
+        )
+    except (OSError, asyncio.TimeoutError):
+        return None
+
+    request_id = 1
+
+    def _pack(req_id: int, ptype: int, payload: str) -> bytes:
+        body = struct.pack("<ii", req_id, ptype) + payload.encode("utf-8") + b"\x00\x00"
+        return struct.pack("<i", len(body)) + body
+
+    async def _read_response() -> tuple[int, int, str]:
+        raw_len = await reader.readexactly(4)
+        length = struct.unpack("<i", raw_len)[0]
+        data = await reader.readexactly(length)
+        req_id, ptype = struct.unpack("<ii", data[:8])
+        body = data[8:-2].decode("utf-8", errors="replace")  # strip two null bytes
+        return req_id, ptype, body
+
+    try:
+        # Authenticate (type 3)
+        writer.write(_pack(request_id, 3, password))
+        await writer.drain()
+        resp_id, _, _ = await asyncio.wait_for(_read_response(), timeout=5)
+        if resp_id == -1:
+            log.warning("RCON authentication failed (wrong password)")
+            writer.close()
+            return None
+
+        # Send command (type 2)
+        request_id += 1
+        writer.write(_pack(request_id, 2, command))
+        await writer.drain()
+        _, _, body = await asyncio.wait_for(_read_response(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+        return body
+    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
+        log.warning(f"RCON error: {e}")
+        try:
+            writer.close()
+        except Exception:
+            pass
+        return None
 
 
-def load_config(path: str = "config.json") -> dict:
-    config = dict(DEFAULT_CONFIG)
+def load_config(path: str = CONFIG_FILENAME) -> dict:
+    config = DEFAULT_CONFIG.copy()
     config_path = Path(path)
 
     if config_path.exists():
@@ -133,9 +323,7 @@ def load_config(path: str = "config.json") -> dict:
             user_config = json.load(f)
         config.update({k: v for k, v in user_config.items() if v is not None})
     else:
-        with open(config_path, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        log.info(f"Created default config at {config_path}")
+        config = create_config()
 
     # Read server port from server.properties if not overridden
     if config.get("server_port") is None:
@@ -154,8 +342,26 @@ def load_config(path: str = "config.json") -> dict:
         log.warning(
             f"Proxy listen_port ({config['listen_port']}) matches server_port "
             f"({config['server_port']}). They must be different! "
-            f"Change one in config.json or server.properties."
+            f"Change one in {CONFIG_FILENAME} or server.properties."
         )
+
+    # Read RCON settings from server.properties
+    config["_rcon_enabled"] = False
+    config["_rcon_port"] = 25575
+    config["_rcon_password"] = ""
+    props_path = Path(config["server_dir"]) / "server.properties"
+    if props_path.exists():
+        with open(props_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("enable-rcon=true"):
+                    config["_rcon_enabled"] = True
+                elif line.startswith("rcon.port="):
+                    config["_rcon_port"] = int(line.split("=", 1)[1].strip())
+                elif line.startswith("rcon.password="):
+                    config["_rcon_password"] = line.split("=", 1)[1].strip()
+    if config["_rcon_enabled"]:
+        log.info(f"RCON detected on port {config['_rcon_port']} (will use as stop fallback)")
 
     # Load icons as base64 data URIs
     for key in ("offline_icon", "starting_icon"):
@@ -173,14 +379,6 @@ def load_config(path: str = "config.json") -> dict:
             config[f"_{key}_data"] = None
 
     return config
-
-
-# =============================================================================
-# Server Process Manager
-# =============================================================================
-
-STARTUP_TIMES_FILE = "startup_times.json"
-MAX_STORED_TIMES = 10
 
 
 def load_startup_times(server_dir: str) -> list[float]:
@@ -241,6 +439,12 @@ def apply_placeholders(text: str, server_dir: str, start_time: float | None = No
     text = text.replace("{{ESTIMATED_TIME_REMAINING}}", format_duration(remaining))
     return text
 
+def find_pid_by_port(port: int) -> int | None:
+    """Find the PID of the process listening on the given port."""
+    for conn in psutil.net_connections(kind="tcp"):
+        if conn.status == "LISTEN" and conn.laddr.port == port:
+            return conn.pid
+    return None
 
 class ServerManager:
     def __init__(self, config: dict):
@@ -320,25 +524,109 @@ class ServerManager:
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
-    async def stop_server(self):
-        """Send 'stop' to the server and wait for it to exit."""
+    async def _try_rcon_stop(self) -> bool:
+        """Attempt to stop the server via RCON. Returns True if RCON command was sent."""
+        if not self.config.get("_rcon_enabled"):
+            return False
+        log.info(f"Attempting RCON stop on port {self.config['_rcon_port']}...")
+        result = await rcon_send(
+            "127.0.0.1",
+            self.config["_rcon_port"],
+            self.config["_rcon_password"],
+            "stop",
+        )
+        if result is None:
+            log.warning("RCON stop failed (connection or auth error).")
+            return False
+        return True
+
+    async def _wait_for_process(self, timeout: int = 30) -> bool:
+        """Wait for the process to exit. Returns True if it exited."""
         if self._process is None or self._process.returncode is not None:
-            return
-        log.info("Sending 'stop' to server...")
-        await self.send_command("stop")
+            return True
         try:
-            await asyncio.wait_for(self._process.wait(), timeout=30)
-            log.info("Server stopped.")
+            await asyncio.wait_for(self._process.wait(), timeout=timeout)
+            return True
         except asyncio.TimeoutError:
-            log.warning("Server did not stop within 30s, killing process.")
+            return False
+
+    async def stop_server(self):
+        """Stop the server: stdin -> RCON fallback -> kill."""
+        has_process = self._process is not None and self._process.returncode is None
+
+        # Attempt 1: stdin which is supported on vanilla servers
+        if has_process:
+            log.info("Sending 'stop' to server via stdin...")
+            await self.send_command("stop")
+            if await self._wait_for_process(30):
+                log.info("Server stopped via stdin.")
+                self._process = None
+                self._ready_event.clear()
+                return
+            log.warning("Server did not stop via stdin within 30s.")
+
+        # Attempt 2: RCON (works even without a process handle)
+        # Typically this is used for modded servers but needs RCON enabled -> less secure
+        if await self._try_rcon_stop():
+            if has_process:
+                if await self._wait_for_process(30):
+                    log.info("Server stopped via RCON.")
+                    self._process = None
+                    self._ready_event.clear()
+                    return
+                log.warning("Server did not stop via RCON within 30s.")
+            else:
+                # No process handle. Wait a bit then check if server is gone
+                log.info("No process handle, waiting for RCON stop to take effect...")
+                await asyncio.sleep(10)
+                if not await self.is_running():
+                    log.info("Server stopped via RCON.")
+                    self._process = None
+                    self._ready_event.clear()
+                    return
+                log.warning("Server still running after RCON stop.")
+
+        # Last resort: kill
+        # Try the subprocess handle first, then find by port via psutil
+        if has_process:
+            log.warning("Killing server process via subprocess handle.")
             self._process.kill()
             await self._process.wait()
+        else:
+            pid = find_pid_by_port(self.config["server_port"])
+            if pid:
+                log.warning(f"Killing server process (PID {pid}) found on port {self.config['server_port']}.")
+                try:
+                    proc = psutil.Process(pid)
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                    log.info(f"Process {pid} terminated.")
+                except psutil.TimeoutExpired:
+                    log.warning(f"Process {pid} did not terminate, sending SIGKILL.")
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    log.error(f"Failed to kill PID {pid}: {e}")
+            else:
+                log.error("Cannot stop server: no process handle, RCON failed, and no PID found on port.")
+
         self._process = None
         self._ready_event.clear()
 
     async def poll_until_ready(self):
+        timeout = self.config.get("startup_timeout")
         while not self._ready_event.is_set():
             await asyncio.sleep(self.config["poll_interval"])
+
+            # Check startup timeout
+            if timeout and self._start_time is not None:
+                elapsed = time.monotonic() - self._start_time
+                if elapsed >= timeout:
+                    log.error(f"Server did not start within {format_duration(timeout)}, killing process.")
+                    self._starting = False
+                    self._start_time = None
+                    await self.stop_server()
+                    return
+
             if await self.is_running():
                 # Record startup duration
                 if self._start_time is not None:
@@ -370,10 +658,12 @@ class ServerManager:
             # If server is no longer running (crashed or stopped externally), exit monitor
             count = await self.get_online_count()
             if count is None:
-                log.info("Auto-stop monitor: server no longer reachable, exiting monitor.")
+                log.info("Auto-stop monitor: server no longer reachable, retrying in 30s.")
                 self._ready_event.clear()
                 self._process = None
-                return
+                
+                await asyncio.sleep(30)
+                continue
 
             if count == 0:
                 if empty_since is None:
@@ -389,10 +679,6 @@ class ServerManager:
                     log.info(f"Auto-stop monitor: {count} player(s) online, resetting countdown.")
                 empty_since = None
 
-
-# =============================================================================
-# Connection Handler
-# =============================================================================
 
 async def handle_connection(
     reader: asyncio.StreamReader,
@@ -428,11 +714,6 @@ async def handle_connection(
             await writer.wait_closed()
         except Exception:
             pass
-
-
-# =============================================================================
-# Status (Server List Ping) Handler
-# =============================================================================
 
 async def handle_status(reader, writer, handshake_packet, config, server_mgr):
     if await server_mgr.is_running():
@@ -483,12 +764,7 @@ async def handle_status(reader, writer, handshake_packet, config, server_mgr):
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             pass
 
-
-# =============================================================================
-# Login Handler
-# =============================================================================
-
-async def handle_login(reader, writer, handshake_packet, protocol_version, config, server_mgr):
+async def handle_login(reader, writer, handshake_packet, protocol_version, config, server_mgr: ServerManager):
     packet_id, login_data = await asyncio.wait_for(read_packet(reader), timeout=10)
     if packet_id != 0x00:
         return
@@ -499,30 +775,34 @@ async def handle_login(reader, writer, handshake_packet, protocol_version, confi
     player_name, _ = decode_string(login_data)
     log.info(f"Player {player_name} connecting (protocol {protocol_version})")
 
+    # Proxy/redirect if it is already running
     if await server_mgr.is_running():
-        await proxy_to_server(reader, writer, handshake_packet, login_start_packet, config)
+        return await proxy_to_server(reader, writer, handshake_packet, login_start_packet, config)
+        
+    # Check RAM
+    ram = psutil.virtual_memory().available /  (1024 ** 3)
+    swap = psutil.swap_memory().free /  (1024 ** 3)
+
+
+    if (
+        (config["ram_required"] is not None and config["ram_required"] > ram) or
+        (config["swap_required"] is not None and config["swap_required"] > swap)
+    ):
+        log.error(f"Server does not have enough memory:\n\tRAM: {config['ram_required']} GB needed, {ram:.2f} GB available\n\tSWAP: {config['swap_required']} GB needed, {swap:.2f} GB free")
+        await send_disconnect_login(writer, config["kick_message_no_memory"])
         return
 
-    # Server not running - start it and kick
     await server_mgr.trigger_start()
     kick_msg = apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)
     await send_disconnect_login(writer, kick_msg)
 
 
-# =============================================================================
-# Kick (Login Disconnect)
-# =============================================================================
-
-async def send_disconnect_login(writer, message: str):
-    """Send a disconnect packet in the Login state (packet 0x00, works for all versions)."""
+async def send_disconnect_login(writer: asyncio.StreamWriter, message: str):
+    """Send a disconnect packet in the Login state"""
     disconnect_json = json.dumps({"text": message})
     writer.write(make_packet(0x00, encode_string(disconnect_json)))
     await writer.drain()
 
-
-# =============================================================================
-# Transparent Proxy
-# =============================================================================
 
 async def proxy_to_server(client_reader, client_writer, handshake_packet, login_start_packet, config):
     try:
@@ -566,9 +846,30 @@ async def proxy_relay(c_reader, c_writer, s_reader, s_writer):
         t.cancel()
 
 
-# =============================================================================
-# Main
-# =============================================================================
+async def watch_config(config: dict, path: str = CONFIG_FILENAME):
+    """Reload config in-place when the file changes on disk."""
+    config_path = Path(path)
+    last_mtime = config_path.stat().st_mtime if config_path.exists() else 0
+
+    while True:
+        await asyncio.sleep(5)
+        try:
+            current_mtime = config_path.stat().st_mtime
+        except OSError:
+            continue
+        if current_mtime != last_mtime:
+            last_mtime = current_mtime
+            try:
+                new_config = load_config(path)
+                # Preserve keys that shouldn't change at runtime
+                new_config.pop("listen_host", None)
+                new_config.pop("listen_port", None)
+                config.update(new_config)
+                log.info("Config reloaded.")
+            except Exception as e:
+                log.warning(f"Failed to reload config: {e}")
+
+
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -576,13 +877,18 @@ async def main():
         datefmt="%H:%M:%S",
     )
 
+
     config = load_config()
     server_mgr = ServerManager(config)
 
+    updater(config)
+
     log.info(f"Proxy listening on {config['listen_host']}:{config['listen_port']}")
-    log.info(f"Server port: {config['server_port']}")
+    log.info(f"Server (redirect) port: {config['server_port']}")
     log.info(f"Start command: {config['start_command']}")
     log.info(f"Auto-stop: after {config['auto_stop_empty_minutes']}m empty")
+
+    asyncio.create_task(watch_config(config))
 
     server = await asyncio.start_server(
         lambda r, w: handle_connection(r, w, config, server_mgr),
