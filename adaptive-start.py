@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-
-VERSION = '2.0.0'
+VERSION = '2.1.1'
 
 """
 Minecraft Adaptive Server Starter (MASS)!
@@ -19,6 +18,9 @@ Then, simply run this program forever and it'll automatically start the server!
 
 """
 Version updates:
+2.1:
+- Adds IP listing - whitelist/blacklist options
+- Fixed no response not working + default * blacklist (2.11)
 
 2.0:
 - Improved killing process: now has RCON and PID killing systems and better auto stop stability
@@ -35,6 +37,7 @@ Version updates:
 
 import asyncio
 import base64
+import fnmatch
 import os
 import json
 import logging
@@ -47,10 +50,12 @@ import psutil
 
 log = logging.getLogger("ServerStarter")
 
+
 CONFIG_FILENAME = "mass-config.json"
+VERIFIED_IPS_FILE = "verified_ips.json"
 
 STARTUP_TIMES_FILE = "startup_times.json"
-MAX_STORED_TIMES = 10
+MAX_STORED_TIMES = 5
 
 """
 DEFAULT CONFIG
@@ -105,7 +110,33 @@ DEFAULT_CONFIG = {
     "auto_update_urls": [
         'https://raw.githubusercontent.com/Kevcore25/MCTools/refs/heads/main/adaptive-start.py', # Official GitHub server
         'https://kaf.kcservers.ca/releases/mass.py' # Private server which may receive more frequent updates - can be removed 
-    ]
+    ],
+
+    ## IP Listing
+    # Kick message, with {{IP}} being the user's IP
+    "ip_listing_kick_message": "\u00A74You have been denied access to the server.\n\nPlease contact an administrator if this is a mistake.",
+
+    # List of IP listing. In whitelist, allow these IPs. In blacklist, only block these IPs. Whitelist is prioritzed over blacklist so you do ["*"] for blacklist and only allow certain whitelists, making it a whitelist mode while setting whitelist to [], it turns into blacklist mode
+    # Ex whitelist only mode: whitelist: [ip, ip], blacklist: ["*"]
+    # Ex blacklist only mode: whitelist: [], blacklist: [ip, ip]
+    "ip_listing_whitelist": [""],
+    "ip_listing_blacklist": [""], # Note that banned-ips.json is merged with this
+
+    # City AND Region for geolocation. 
+    # If this is NOT empty then it turns into a whitelist only mode for cities
+    # City is always lowercase and region is uppercase
+    # Note: This uses an external API fetch.
+    "ip_listing_whitelist_city": [],
+
+    # If True, a connection is not made if the IP is found on the blacklist (which means kick messages won't work)
+    # Works with geoblock but only partial SmartMode (blocks malicious only)
+    "ip_listing_no_response": False,
+
+    # SmartMode: If True, it blocks certain IPs like VPNs, proxies, etc
+    # However, if the user already exists in usercache.json or in whitelist.json then VPNs and Proxies are allowed
+    # It also allows any IP in the whitelist
+    # Note: This uses an external API fetch.
+    "ip_listing_smartmode": True
 }
 
 
@@ -137,7 +168,14 @@ def updater(config: dict[str, list[str]]):
                 raise Exception(f"Returned status code {r.status_code}")
             
             # Get version
-            version = r.text.splitlines()[0].split('=', 1)[1].strip().strip("'").strip('"')
+            for i in range(10):
+                try:
+                    version = r.text.splitlines()[i].split('=', 1)[1].strip().strip("'").strip('"')
+                    break
+                except: pass
+            else:
+                raise IndexError
+            
             log.info(f"Found server #{i} with version {version} (Current version {VERSION})")
 
             if compareVersion(version, VERSION):
@@ -687,6 +725,56 @@ async def handle_connection(
     server_mgr: ServerManager,
 ):
     addr = writer.get_extra_info("peername")
+
+    # Return if IP in the blacklist
+    smdata = None
+    citydata = None
+
+    if config["ip_listing_no_response"]:
+        ip = addr[0]
+        try:
+
+            # Skip but warn if private
+            if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("176.16."):
+                raise UserWarning("allowing private IP exception")
+
+            # Fast cache - skip all API checks if this IP already passed
+            if ip in verified_ips:
+                raise UserWarning("cached safe IP")
+
+            # Geolocation
+            if config["ip_listing_whitelist_city"]:
+                citydata = requests.get(f"https://api.sefinek.net/api/v2/geoip/{ip}").json().get("data", {"city": "unknown", "region": "unknown"})
+
+                if citydata["city"].lower() not in config["ip_listing_whitelist_city"] and citydata["region"].upper() not in config["ip_listing_whitelist_city"]: 
+                    raise ConnectionRefusedError(f"not in whitelist city ({citydata['city']} | {citydata['region']})")
+                
+            # Whitelist/Blacklist check 
+            whitelist = config["ip_listing_whitelist"]
+            blacklist = config["ip_listing_blacklist"]
+
+            if whitelist or blacklist:
+                in_whitelist = any(fnmatch.fnmatch(ip, p) for p in whitelist)
+                in_blacklist = any(fnmatch.fnmatch(ip, p) for p in blacklist)
+
+                if not in_whitelist and in_blacklist:
+                    raise ConnectionRefusedError(f"in blacklist")
+                
+            # SmartMode
+            if config["ip_listing_smartmode"] and not in_whitelist:
+                smdata = requests.get(f"https://api.sefinek.net/api/v2/ip-checker/{ip}").json()
+                # Autoblock Malicious and TOR
+                if smdata["malicious"] or smdata["tor"]:
+                    raise ConnectionRefusedError(f"malicious")
+        except UserWarning:
+            pass
+        except ConnectionRefusedError as e:
+            log.warning(f"Blocked IP ({ip}) due to: {e}")
+            return
+        except Exception as e:
+            log.error(f"Handle connection IP verify error: {e}")
+            return
+
     try:
         packet_id, handshake_data = await asyncio.wait_for(read_packet(reader), timeout=10)
         if packet_id != 0x00:
@@ -703,7 +791,7 @@ async def handle_connection(
         if next_state == 1:
             await handle_status(reader, writer, handshake_packet, config, server_mgr)
         elif next_state == 2:
-            await handle_login(reader, writer, handshake_packet, protocol_version, config, server_mgr)
+            await handle_login(reader, writer, handshake_packet, protocol_version, config, server_mgr, addr, smdata, citydata)
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError) as e:
         log.debug(f"Connection {addr} closed: {e}")
     except Exception as e:
@@ -715,7 +803,7 @@ async def handle_connection(
         except Exception:
             pass
 
-async def handle_status(reader, writer, handshake_packet, config, server_mgr):
+async def handle_status(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, handshake_packet, config, server_mgr):
     if await server_mgr.is_running():
         # Proxy the status request to the real server
         try:
@@ -764,7 +852,26 @@ async def handle_status(reader, writer, handshake_packet, config, server_mgr):
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             pass
 
-async def handle_login(reader, writer, handshake_packet, protocol_version, config, server_mgr: ServerManager):
+def load_verified_ips() -> list[str]:
+    p = Path(VERIFIED_IPS_FILE)
+    if p.exists():
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    else:
+        with open(p, 'x') as f:
+            f.write('[]')
+    return []
+
+def save_verified_ips(ips: list[str]):
+    with open(VERIFIED_IPS_FILE, "w") as f:
+        json.dump(ips, f)
+
+verified_ips = load_verified_ips()
+
+async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, handshake_packet, protocol_version, config, server_mgr: ServerManager, addr, smdata, citydata):
     packet_id, login_data = await asyncio.wait_for(read_packet(reader), timeout=10)
     if packet_id != 0x00:
         return
@@ -773,7 +880,70 @@ async def handle_login(reader, writer, handshake_packet, protocol_version, confi
 
     # Parse player name
     player_name, _ = decode_string(login_data)
-    log.info(f"Player {player_name} connecting (protocol {protocol_version})")
+    log.info(f"Player {player_name} connecting using {addr[0]}:{addr[1]} (protocol {protocol_version})")
+
+    ## IP LISTING
+    try:
+        ip: str = addr[0]
+
+        # Skip but warn if private
+        if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("176.16."):
+            raise UserWarning("allowing private IP exception")
+
+        # Fast cache — skip all API checks if this IP already passed
+        if ip in verified_ips:
+            raise UserWarning("cached safe IP")
+
+        # Geolocation
+        if config["ip_listing_whitelist_city"]:
+            if citydata is None:
+                citydata = requests.get(f"https://api.sefinek.net/api/v2/geoip/{ip}").json().get("data", {"city": "unknown", "region": "unknown"})
+
+            if citydata["city"].lower() not in config["ip_listing_whitelist_city"] and citydata["region"].upper() not in config["ip_listing_whitelist_city"]: 
+                raise ConnectionRefusedError(f"not in whitelist city ({citydata['city']} | {citydata['region']})")
+            
+        # Whitelist/Blacklist check 
+        whitelist = config["ip_listing_whitelist"]
+        blacklist = config["ip_listing_blacklist"]
+
+        if whitelist or blacklist:
+            in_whitelist = any(fnmatch.fnmatch(ip, p) for p in whitelist)
+            in_blacklist = any(fnmatch.fnmatch(ip, p) for p in blacklist)
+
+            if not in_whitelist and in_blacklist:
+                raise ConnectionRefusedError(f"in blacklist")
+            
+        # SmartMode
+        if config["ip_listing_smartmode"] and not in_whitelist:
+            if smdata is None:
+                smdata = requests.get(f"https://api.sefinek.net/api/v2/ip-checker/{ip}").json()
+            # Autoblock Malicious and TOR
+            if smdata["malicious"] or smdata["tor"]:
+                raise ConnectionRefusedError(f"malicious")
+            
+            # VPN or Proxy but accept if in usercache.json
+            # Intended for Online servers where a diff IP will just simply get blocked from invalid session
+            if smdata["vpn"] or smdata["proxy"]:
+                with open("usercache.json", 'r') as f:
+                    usercache = json.load(f)
+                for user in usercache:
+                    if player_name == user["name"]: 
+                        log.info(f"{player_name} has a proxy IP but has joined before")
+                        break
+                else:
+                    raise ConnectionRefusedError("proxy")
+
+        # All checks passed - cache this IP
+        if ip not in verified_ips:
+            verified_ips.append(ip)
+            save_verified_ips(verified_ips)
+
+    except UserWarning:
+        pass
+    except ConnectionRefusedError as e:
+        return await send_disconnect_login(writer, config["ip_listing_kick_message"].replace("{{IP}}", ip).replace("{{REASON}}", str(e)))
+    except Exception as e:
+        log.error(f"IP listing exception: {e}")
 
     # Proxy/redirect if it is already running
     if await server_mgr.is_running():
