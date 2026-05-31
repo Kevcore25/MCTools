@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-VERSION = '2.1.1'
+VERSION = '3.0.0'
 
 """
 Minecraft Adaptive Server Starter (MASS)!
@@ -10,17 +10,23 @@ or stops a Minecraft server if no players are online within a set period.
 Now has RAM/SWAP requirements to start!
 
 HOW TO USE:
-Just put this file in an already started Minecraft server directory and it'll 
-automatically adjust its config values!
+Just put this file in an already started Minecraft server directory and it'll automatically adjust its config values!
 Run the program and then ensure the config is accurate and suited for your needs.
 Then, simply run this program forever and it'll automatically start the server!
 """
 
 """
 Version updates:
+3.0:
+- Switched config format from JSON to YAML
+- Optional startup lock file 
+- Auto RAM detection
+- MOTD server.properties copy
+
 2.1:
 - Adds IP listing - whitelist/blacklist options
-- Fixed no response not working + default * blacklist (2.11)
+- Fixed no response not working + default * blacklist (2.1.1)
+- Fixed various bugs (2.1.2)
 
 2.0:
 - Improved killing process: now has RCON and PID killing systems and better auto stop stability
@@ -37,21 +43,24 @@ Version updates:
 
 import asyncio
 import base64
+import fcntl
 import fnmatch
 import os
 import json
 import logging
+import re
 import requests
 import struct
 import time
 from pathlib import Path
 import psutil
+import yaml
 
 
 log = logging.getLogger("ServerStarter")
 
 
-CONFIG_FILENAME = "mass-config.json"
+CONFIG_FILENAME = "mass-config.yaml"
 VERIFIED_IPS_FILE = "verified_ips.json"
 
 STARTUP_TIMES_FILE = "startup_times.json"
@@ -60,85 +69,156 @@ MAX_STORED_TIMES = 5
 """
 DEFAULT CONFIG
 
-Note that below is the default config. 
-When the program starts, a config.json will be made and you can change things from there.
+Below is the default YAML config that gets written on first run.
+The comments inside the template are written verbatim into mass-config.yaml so users can edit and discover options directly from the file.
 
-TL;DR Don't change the default config below!!
+TL;DR Don't change the default below unless you want to change MASS's defaults.
 """
-DEFAULT_CONFIG = {
-    # Proxy ports
-    "listen_host": "0.0.0.0",
-    "listen_port": 25565,
-    "server_port": None, # should be None like 99% of the time - it auto detects based on server.properties
-    "server_dir": ".",
+DEFAULT_CONFIG_YAML = """\
+# =========================================================================
+# Minecraft Adaptive Server Starter (MASS) configuration
+# =========================================================================
 
-    # Start command (e.g. sh start.sh). You probably shouldn't use nohup here and rather nohup this python script instead
-    "start_command": "java -Xmx4G -server -jar server.jar nogui",
+# -------------------------------------------------------------------------
+# Proxy & Server Ports
+# -------------------------------------------------------------------------
 
-    # Amount of RAM/SWAP required (in GB) to start the program - if it is too low then the server won't start
-    # If set to None/null/0 then this is ignored
-    "ram_required": 4.5,
-    "swap_required": None,
-    # Message to kick if no memory
-    "kick_message_no_memory": "\u00A74The physical server does not have enough memory to wake the Minecraft server!\n\n\u00A74This issue should be reported to the administrators.",
+# IP/host the proxy listens on
+listen_host: 0.0.0.0
+listen_port: 25565
 
-    # Messages for starting/offline
-    # {{ESTIMATED_TIME_REMAINING}} and {{ESTIMATED_TIME}} are available placeholders
-    "kick_message": "\u00A7eThis server is waking up...\u00A7r\n\n\u00A7bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}",
-    "offline_motd": "\u00A74This server is sleeping.\u00A7r\n\u00A7aJoin it to wake it! ({{ESTIMATED_TIME}})",
-    "starting_motd": "\u00A7eThis server is waking up...\u00A7r\n\u00A7bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}",
-    "offline_version_text": "\u00a74Sleeping",
-    "starting_version_text": "\u00a7eWaking...",
+# Server port. Typically this is null as it will be detected automatically.
+server_port: null
 
-    # Duration of empty players (in min) before the stop cmd is ran
-    "auto_stop_empty_minutes": 2,
+# Server directory (where server.properties / start.sh live)
+server_dir: .
 
-    # Max time (in seconds) to wait for the server to start before killing it. None = no timeout
-    "startup_timeout": 300,
+# -------------------------------------------------------------------------
+# Server Start Command
+# -------------------------------------------------------------------------
 
-    # Polling intervals - default should be fine
-    "poll_interval": 0.5,
-    "auto_stop_poll_interval": 3,
+# Command used to start the server (e.g. "bash start.sh")
+start_command: "java -Xmx4G -server -jar server.jar nogui"
 
-    # Default icons made with basic shapes in Google Drawings
-    "offline_icon": None,
-    "starting_icon": None,
+# -------------------------------------------------------------------------
+# Memory Requirements
+# -------------------------------------------------------------------------
 
-    # Whether the starter should check for updates and download them automatically
-    # For security/stabiliy this should be disabled but this is enabled by default as the project is pretty small and in development
-    "auto_update": True,
-    "auto_update_urls": [
-        'https://raw.githubusercontent.com/Kevcore25/MCTools/refs/heads/main/adaptive-start.py', # Official GitHub server
-        'https://kaf.kcservers.ca/releases/mass.py' # Private server which may receive more frequent updates - can be removed 
-    ],
+# Required free RAM/SWAP (in GB) before the server is allowed to start.
+#   null or 0: skip the check (disabled)
+#   -1:        auto-detect
+ram_required: -1
+swap_required: null
 
-    ## IP Listing
-    # Kick message, with {{IP}} being the user's IP
-    "ip_listing_kick_message": "\u00A74You have been denied access to the server.\n\nPlease contact an administrator if this is a mistake.",
+# Kick message when there isn't enough memory available.
+kick_message_no_memory: "\u00A74The physical server does not have enough memory to wake the Minecraft server!\\n\\n\u00A74This issue should be reported to the administrators."
 
-    # List of IP listing. In whitelist, allow these IPs. In blacklist, only block these IPs. Whitelist is prioritzed over blacklist so you do ["*"] for blacklist and only allow certain whitelists, making it a whitelist mode while setting whitelist to [], it turns into blacklist mode
-    # Ex whitelist only mode: whitelist: [ip, ip], blacklist: ["*"]
-    # Ex blacklist only mode: whitelist: [], blacklist: [ip, ip]
-    "ip_listing_whitelist": [""],
-    "ip_listing_blacklist": [""], # Note that banned-ips.json is merged with this
+# -------------------------------------------------------------------------
+# Startup Coordination Lock
+# -------------------------------------------------------------------------
 
-    # City AND Region for geolocation. 
-    # If this is NOT empty then it turns into a whitelist only mode for cities
-    # City is always lowercase and region is uppercase
-    # Note: This uses an external API fetch.
-    "ip_listing_whitelist_city": [],
+# Optional path to a lock file. While the lock is held, other MASS instances
+# pointed at the same file will not start their servers - useful when several
+# servers share one machine and you want to stagger startups.
+# The lock is acquired before launching the server and released once the
+# server is ready, fails to start, or is stopped. Set to null to disable.
+lock_file: null
 
-    # If True, a connection is not made if the IP is found on the blacklist (which means kick messages won't work)
-    # Works with geoblock but only partial SmartMode (blocks malicious only)
-    "ip_listing_no_response": False,
+# Kick message when another MASS instance currently holds the start lock.
+kick_message_locked: "\u00A7eAnother server is currently starting up on this machine.\\n\u00A7bPlease try again in a moment."
 
-    # SmartMode: If True, it blocks certain IPs like VPNs, proxies, etc
-    # However, if the user already exists in usercache.json or in whitelist.json then VPNs and Proxies are allowed
-    # It also allows any IP in the whitelist
-    # Note: This uses an external API fetch.
-    "ip_listing_smartmode": True
-}
+# -------------------------------------------------------------------------
+# Display Messages
+# For when the server is being started / has not started yet.
+# -------------------------------------------------------------------------
 
+# Placeholders available: {{ESTIMATED_TIME_REMAINING}} and {{ESTIMATED_TIME}}.
+kick_message: "\u00A7eThis server is waking up...\u00A7r\\n\\n\u00A7bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}"
+offline_motd: "\u00A74This server is sleeping.\u00A7r\\n\u00A7aJoin it to wake it! ({{ESTIMATED_TIME}})"
+starting_motd: "\u00A7eThis server is waking up...\u00A7r\\n\u00A7bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}"
+
+# Version text to be displayed
+offline_version_text: "\u00A74Sleeping"
+starting_version_text: "\u00A7eWaking..."
+
+# If true, use the MOTD value from server.properties for both the offline and starting MOTD
+# Otherwise it will use the MOTDs set in this config.
+use_server_properties_motd: false
+
+# -------------------------------------------------------------------------
+# Auto-stop & Timing
+# -------------------------------------------------------------------------
+
+# After how many minutes should the server be stopped
+# Set null to disable
+auto_stop_empty_minutes: 2
+
+# Amount of seconds to check the number of players online and determine the stop timeout
+auto_stop_poll_interval: 3
+
+# Max seconds to wait for the server to become reachable before MASS kills the process
+# Set null to disable
+startup_timeout: 300
+
+# Amount of seconds to check if the server is online
+poll_interval: 0.5
+
+
+# -------------------------------------------------------------------------
+# Icons
+# -------------------------------------------------------------------------
+
+# Paths to PNG icons (relative to server_dir).
+# Set to null to disable.
+offline_icon: null
+starting_icon: null
+
+# -------------------------------------------------------------------------
+# Auto Update
+# -------------------------------------------------------------------------
+
+# Whether MASS checks for updates and self-replaces. Disable for stricter
+# stability/security. Enabled by default since the project is small and in
+# active development.
+auto_update: true
+auto_update_urls:
+  - https://raw.githubusercontent.com/Kevcore25/MCTools/refs/heads/main/adaptive-start.py
+  - https://kaf.kcservers.ca/releases/mass.py
+
+# -------------------------------------------------------------------------
+# IP Listing
+# -------------------------------------------------------------------------
+
+# Kick message for blocked IPs. {{IP}} and {{REASON}} are substituted.
+ip_listing_kick_message: "\u00A74You have been denied access to the server.\\n\\nPlease contact an administrator if this is a mistake."
+
+# Whitelist/Blacklist IPs.
+# Whitelist always takes priority over blacklist; thus, for a
+#   Whitelist-only mode -> whitelist: [ip, ip], blacklist: ["*"]
+#   Blacklist-only mode -> whitelist: [],       blacklist: [ip, ip]
+# (banned-ips.json is automatically merged with the blacklist.)
+ip_listing_whitelist:
+  - ""
+ip_listing_blacklist:
+  - ""
+
+# Geolocation whitelist. If non-empty, becomes city/region whitelist mode.
+# City entries should be lowercase, region entries uppercase.
+# Note: this uses an external API.
+ip_listing_whitelist_city: []
+
+# If true, drop the connection silently rather than sending a kick reason.
+# SmartMode has partial function if this is on.
+ip_listing_no_response: false
+
+# SmartMode blocks VPNs / proxies / TOR / malicious IPs via an external API.
+# - IPs already in usercache.json are still allowed (proxy users who joined before)
+# - Any IP matching the whitelist always passes
+ip_listing_smartmode: true
+"""
+
+# Loaded once on import for fallback defaults (used by load_config + reload).
+DEFAULT_CONFIG: dict[str, str|int|list[str]|bool|None|float] = yaml.safe_load(DEFAULT_CONFIG_YAML)
 
 
 def compareVersion(version1: str, version2: str) -> int:
@@ -156,7 +236,7 @@ def compareVersion(version1: str, version2: str) -> int:
     return False
 
 def updater(config: dict[str, list[str]]):
-
+    """Checks for updates and updates the file if needed"""
     log.info("Checking for updates...")
 
     for i, url in enumerate(config["auto_update_urls"], start=1):
@@ -167,10 +247,10 @@ def updater(config: dict[str, list[str]]):
             if r.status_code != 200:
                 raise Exception(f"Returned status code {r.status_code}")
             
-            # Get version
-            for i in range(10):
+            # Get version. The correct format is within 10 lines of code
+            for j in range(10):
                 try:
-                    version = r.text.splitlines()[i].split('=', 1)[1].strip().strip("'").strip('"')
+                    version = r.text.splitlines()[j].split('=', 1)[1].strip().strip("'").strip('"')
                     break
                 except: pass
             else:
@@ -193,40 +273,111 @@ def updater(config: dict[str, list[str]]):
     else:
         log.info("The updater did not update the file")
 
-def create_config(config_path: str = CONFIG_FILENAME):
-    config = DEFAULT_CONFIG.copy()
+def get_xmx(text: str) -> float | None:
+    """Return the -Xmx value (in GB) found in text, or None if not present"""
+    match = re.search(r"-Xmx(\d+(?:\.\d+)?)([gGmMkK]?)", text)
 
-    # Server.properties
+    if match is None:
+        return None
+    
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+
+    match unit:
+        # surely no one uses T right (does it even exist)
+        case "g":
+            return value
+        case "m":
+            return value / 1024
+        case "k":
+            return value / (1024 ** 2)
+        case _:
+            return value / (1024 ** 3)
+
+
+def detect_ram_from_command(command: str, server_dir: str) -> float | None:
+    """Parse the start command (recursing into any referenced .sh) for -Xmx"""
+    direct = get_xmx(command)
+    if direct is not None:
+        return direct
+
+    script_match = re.search(r"(\S+\.sh)\b", command)
+    if script_match:
+        script_path = Path(server_dir) / script_match.group(1)
+        if script_path.exists():
+            try:
+                with open(script_path) as f:
+                    return get_xmx(f.read())
+            except OSError:
+                pass
+    return None
+
+
+def read_server_properties_motd(server_dir: str) -> str | None:
+    """Return the `motd=` value from server.properties, decoded from escape codes."""
+    props_path = Path(server_dir) / "server.properties"
+    if not props_path.exists():
+        return None
+    try:
+        with open(props_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("motd="):
+                    raw = line.split("=", 1)[1]
+                    # server.properties stores section signs as literal §
+                    try:
+                        return raw.encode("latin-1", "ignore").decode("unicode_escape")
+                    except UnicodeDecodeError:
+                        return raw
+    except OSError:
+        return None
+    return None
+
+
+def create_config(config_path: str = CONFIG_FILENAME):
+    template = DEFAULT_CONFIG_YAML
+    overrides: dict[str, str] = {}
+
+    # Server.properties: shift backend port by +1 and let the proxy use the original.
     if Path("server.properties").exists():
-        with open("server.properties", 'r') as f:
+        with open("server.properties", "r") as f:
             props = f.readlines()
 
-        # Change server-port to +1 if it exists and set the proxy port to it instead
         for i, ln in enumerate(props):
-            if ln.startswith('#') or ln.isspace() or ln == '': 
+            if ln.startswith("#") or ln.isspace() or ln == "":
                 continue
-            
-            k, v = ln.rstrip('\n').split('=')
-
+            k, v = ln.rstrip("\n").split("=", 1)
             if k == "server-port":
                 v = int(v)
-                config["listen_port"] = v
-                props[i] = f"server-port={v+1}\n"
-                with open("server.properties", 'w') as f:
+                overrides["listen_port"] = str(v)
+                props[i] = f"server-port={v + 1}\n"
+                with open("server.properties", "w") as f:
                     f.writelines(props)
-                log.info(f"The server port is switched from {v} to {v+1} and the proxy server's port is set to {v}")
+                log.info(
+                    f"The server port is switched from {v} to {v + 1} and the proxy "
+                    f"server's port is set to {v}"
+                )
                 break
 
-    # bash start.sh
+    # start.sh wrapper
     if Path("start.sh").exists():
-        config["start_command"] = "bash start.sh"
+        overrides["start_command"] = '"bash start.sh"'
 
+    # Apply overrides by replacing the template's default value lines.
+    for key, replacement in overrides.items():
+        template = re.sub(
+            rf"^({re.escape(key)}):.*$",
+            lambda m, r=replacement: f"{m.group(1)}: {r}",
+            template,
+            count=1,
+            flags=re.MULTILINE,
+        )
 
     with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+        f.write(template)
 
     log.info(f"Created default config at {config_path}")
-    return config
+    return yaml.safe_load(template)
     
 # =============================================================================
 # Protocol Primitives
@@ -352,16 +503,48 @@ async def rcon_send(host: str, port: int, password: str, command: str) -> str | 
         return None
 
 
+def migrate_legacy_json(yaml_path: str, old_path: str = "mass-config.json") -> dict | None:
+    """Convert mass-config.json -> mass-config.yaml (without comments). Returns merged config."""
+    legacy = Path(old_path)
+    if not legacy.exists():
+        return None
+    try:
+        with open(legacy) as f:
+            user_data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning(f"Found {old_path} but couldn't parse it: {e}")
+        return None
+
+    merged = DEFAULT_CONFIG.copy()
+    merged.update({k: v for k, v in user_data.items() if v is not None})
+
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(merged, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    try:
+        os.rename(legacy, str(legacy) + ".bak")
+    except OSError:
+        pass
+    log.info(
+        f"Migrated legacy {old_path} to {yaml_path} (original saved as {old_path}.bak)."
+    )
+    return merged
+
+
 def load_config(path: str = CONFIG_FILENAME) -> dict:
     config = DEFAULT_CONFIG.copy()
     config_path = Path(path)
 
     if config_path.exists():
         with open(config_path) as f:
-            user_config = json.load(f)
+            user_config = yaml.safe_load(f) or {}
         config.update({k: v for k, v in user_config.items() if v is not None})
     else:
-        config = create_config()
+        # Try migration of old to new config
+        migrated = migrate_legacy_json(path)
+        if migrated is not None:
+            config = migrated
+        else:
+            config = create_config()
 
     # Read server port from server.properties if not overridden
     if config.get("server_port") is None:
@@ -400,6 +583,29 @@ def load_config(path: str = CONFIG_FILENAME) -> dict:
                     config["_rcon_password"] = line.split("=", 1)[1].strip()
     if config["_rcon_enabled"]:
         log.info(f"RCON detected on port {config['_rcon_port']} (will use as stop fallback)")
+
+    # Auto-detect ram_required from -Xmx if set to -1
+    if config.get("ram_required") == -1:
+        detected = detect_ram_from_command(config["start_command"], config["server_dir"])
+        if detected is not None:
+            log.info(f"Auto-detected ram_required={detected:.2f} GB from start command (-Xmx).")
+            config["ram_required"] = detected
+        else:
+            log.warning(
+                "ram_required is -1 but no -Xmx flag was found in the start command "
+                "or its referenced script. Disabling the RAM check."
+            )
+            config["ram_required"] = None
+
+    # Cache server.properties MOTD if the option is enabled
+    config["_server_properties_motd"] = None
+    if config.get("use_server_properties_motd"):
+        motd = read_server_properties_motd(config["server_dir"])
+        if motd:
+            config["_server_properties_motd"] = motd
+            log.info(f"Using MOTD from server.properties: {motd!r}")
+        else:
+            log.warning("use_server_properties_motd is enabled but no MOTD was found in server.properties.")
 
     # Load icons as base64 data URIs
     for key in ("offline_icon", "starting_icon"):
@@ -493,6 +699,48 @@ class ServerManager:
         self._ready_event = asyncio.Event()
         self._lock = asyncio.Lock()
         self._auto_stop_task: asyncio.Task | None = None
+        # Cross-process startup lock (held while a server is in the startup phase).
+        self._start_lock_fd: int | None = None
+
+    def _acquire_start_lock(self) -> bool:
+        """Try to acquire the cross-process startup lock. Returns True if held (or disabled)."""
+        lock_path = self.config.get("lock_file")
+        if not lock_path:
+            return True
+        if self._start_lock_fd is not None:
+            return True
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            log.warning(f"Could not open lock file {lock_path}: {e}. Proceeding without lock.")
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return False
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass
+        self._start_lock_fd = fd
+        log.info(f"Acquired startup lock: {lock_path}")
+        return True
+
+    def _release_start_lock(self):
+        if self._start_lock_fd is None:
+            return
+        try:
+            fcntl.flock(self._start_lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self._start_lock_fd)
+        except OSError:
+            pass
+        self._start_lock_fd = None
+        log.info("Released startup lock.")
 
     async def status_ping(self) -> dict | None:
         """Ping the server and return the parsed status JSON, or None on failure."""
@@ -535,11 +783,23 @@ class ServerManager:
         except (KeyError, TypeError):
             return None
 
-    async def trigger_start(self):
-        """Start the server process if not already started. Non-blocking."""
+    async def trigger_start(self) -> str:
+        """Start the server process if not already started. Non-blocking.
+
+        Returns one of:
+          - "started":  startup has been triggered
+          - "starting": another caller already triggered startup
+          - "running":  the server is already up
+          - "locked":   another MASS instance holds the start lock
+        """
         async with self._lock:
-            if self._starting or await self.is_running():
-                return
+            if self._starting:
+                return "starting"
+            if await self.is_running():
+                return "running"
+            if not self._acquire_start_lock():
+                log.info("Startup blocked: another MASS instance holds the lock.")
+                return "locked"
             self._starting = True
             self._start_time = time.monotonic()
             self._ready_event.clear()
@@ -552,6 +812,7 @@ class ServerManager:
                 stderr=None,
             )
             asyncio.create_task(self.poll_until_ready())
+            return "started"
 
     async def send_command(self, command: str):
         """Send a command to the server's stdin."""
@@ -649,6 +910,7 @@ class ServerManager:
 
         self._process = None
         self._ready_event.clear()
+        self._release_start_lock()
 
     async def poll_until_ready(self):
         timeout = self.config.get("startup_timeout")
@@ -663,6 +925,7 @@ class ServerManager:
                     self._starting = False
                     self._start_time = None
                     await self.stop_server()
+                    self._release_start_lock()
                     return
 
             if await self.is_running():
@@ -678,6 +941,7 @@ class ServerManager:
                     log.info("Server is ready!")
                 self._starting = False
                 self._ready_event.set()
+                self._release_start_lock()
                 # Start auto-stop monitor
                 if self._auto_stop_task is None or self._auto_stop_task.done():
                     self._auto_stop_task = asyncio.create_task(self.auto_stop_monitor())
@@ -823,10 +1087,13 @@ async def handle_status(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             return
 
         is_starting = server_mgr._starting
-        motd = apply_placeholders(
-            config["starting_motd"] if is_starting else config["offline_motd"],
-            config["server_dir"], server_mgr._start_time,
-        )
+        if config.get("use_server_properties_motd") and config.get("_server_properties_motd"):
+            motd = config["_server_properties_motd"]
+        else:
+            motd = apply_placeholders(
+                config["starting_motd"] if is_starting else config["offline_motd"],
+                config["server_dir"], server_mgr._start_time,
+            )
         version_text = apply_placeholders(
             config["starting_version_text"] if is_starting else config["offline_version_text"],
             config["server_dir"], server_mgr._start_time,
@@ -962,8 +1229,14 @@ async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         await send_disconnect_login(writer, config["kick_message_no_memory"])
         return
 
-    await server_mgr.trigger_start()
-    kick_msg = apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)
+    status = await server_mgr.trigger_start()
+    if status == "locked":
+        kick_msg = apply_placeholders(
+            config.get("kick_message_locked") or config["kick_message"],
+            config["server_dir"], server_mgr._start_time,
+        )
+    else:
+        kick_msg = apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)
     await send_disconnect_login(writer, kick_msg)
 
 
@@ -1043,10 +1316,9 @@ async def watch_config(config: dict, path: str = CONFIG_FILENAME):
 async def main():
     logging.basicConfig(
         level=logging.INFO,
-        format="[%(asctime)s] [Server starter/%(levelname)s]: %(message)s",
+        format="[%(asctime)s] [MASS/%(levelname)s]: %(message)s",
         datefmt="%H:%M:%S",
     )
-
 
     config = load_config()
     server_mgr = ServerManager(config)
