@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-VERSION = '3.0.0'
+VERSION = '3.1.0'
 
 """
 Minecraft Adaptive Server Starter (MASS)!
@@ -7,16 +7,24 @@ Minecraft Adaptive Server Starter (MASS)!
 This is a script/program that will start a Minecraft server if a player tries to join,
 or stops a Minecraft server if no players are online within a set period.
 
+Currently only works and tested with Linux (more specifically, Debian/Ubuntu systems).
+
 Now has RAM/SWAP requirements to start!
 
 HOW TO USE:
 Just put this file in an already started Minecraft server directory and it'll automatically adjust its config values!
 Run the program and then ensure the config is accurate and suited for your needs.
 Then, simply run this program forever and it'll automatically start the server!
+
+PIP REQUIREMENTS:
+pip install requests pyyaml cryptography google-auth google-auth-httplib2 google-auth-oauthlib google-api-python-client
 """
 
 """
 Version updates:
+3.1:
+- Added cloud backup
+
 3.0:
 - Switched config format from JSON to YAML
 - Optional startup lock file 
@@ -55,7 +63,8 @@ import time
 from pathlib import Path
 import psutil
 import yaml
-
+import random
+import threading
 
 log = logging.getLogger("ServerStarter")
 
@@ -212,14 +221,198 @@ ip_listing_whitelist_city: []
 ip_listing_no_response: false
 
 # SmartMode blocks VPNs / proxies / TOR / malicious IPs via an external API.
-# - IPs already in usercache.json are still allowed (proxy users who joined before)
+# - IPs already in usercache.json are still allowed (users who joined before)
 # - Any IP matching the whitelist always passes
 ip_listing_smartmode: true
+
+# -------------------------------------------------------------------------
+# Automatic backups (Google Drive)
+# -------------------------------------------------------------------------
+
+# Backups are uploaded to Google Drive in the naming scheme: backup{id}.ext
+
+# Enable backups. The world folder (found in server.properties) is backed up upon a server sleep under certain conditions.
+# If a player attempts to start the server while the server is backing up the world, the player is refused.
+# However, a player who already joined the server before can join back again, causing the backup to be stopped.
+backups: false
+
+# Filename (location) of the Google Drive API Credentials file.
+# You need to create one if this does not exist.
+credentials_file: null
+
+# Google Drive Folder ID for the world to be backed up to
+drive_folder_id: null
+
+# Maximum backup amount (if this number is reached, the oldest backup is deleted)
+max_backups: 3
+
+# Backup kick message, when the server is being backed up.
+backup_kick_message: "\u00A77The server is being backed up.\\n\\nPlease wait a moment before reconnecting.\\n\\nCurrently taking {{BACKUP_TIME}}s | Stage: {{BACKUP_STAGE}}"
+
+# Naming scheme. Placeholder {{ID}} generates a random number. 
+# Do not put file extensions (e.g. .zip) as they will automatically be added. 
+backup_naming_scheme: backup{{ID}}
+
+# Compression method. Available options: zstandard, zip
+# Zstandard allows for efficient compression as Minecraft region files already use it.
+# Zstandard requires the zstandard package from PyPi (pip install zstandard) IF your Python version is 3.13 or lower.
+compression_method: zstandard
+
+# Level of compression. Higher numbers decrease file size but greatly increases the time required to compress.
+# It is recommended to keep it somewhat low (2-3) unless you really need the compression (5-9)
+compression_level: 3
 """
 
 # Loaded once on import for fallback defaults (used by load_config + reload).
 DEFAULT_CONFIG: dict[str, str|int|list[str]|bool|None|float] = yaml.safe_load(DEFAULT_CONFIG_YAML)
 
+backup_time = None
+
+class DriveAPI:
+    def __init__(self, credentialsFile: str):
+        self.credentials = credentialsFile
+        self.__get_drive_service()
+
+    def __get_drive_service(self):
+        """Authenticates and returns the Google Drive API service instance"""
+        creds = None
+        tokenFile = 'driveAPIauth.token'
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.transport.requests import Request
+        import googleapiclient.discovery
+        import pickle
+
+        if os.path.exists(tokenFile):
+            with open(tokenFile, 'rb') as token:
+                creds = pickle.load(token)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    'credentials.json', ['https://www.googleapis.com/auth/drive'])
+                creds = flow.run_local_server(port=0)
+
+            with open(tokenFile, 'wb') as token:
+                pickle.dump(creds, token)
+
+        self.service: googleapiclient.discovery.Resource = googleapiclient.discovery.build('drive', 'v3', credentials=creds)
+
+    def upload_file(self, filename: str, folder_id: str = None) -> str:
+        """Uploads a file to a specified Google Drive folder and returns its ID"""
+        from googleapiclient.http import MediaFileUpload
+        from googleapiclient.errors import HttpError
+
+        try:
+            file_name = os.path.basename(filename)
+            
+            file_metadata = {'name': file_name}
+            if folder_id:
+                file_metadata['parents'] = [folder_id]
+
+            media = MediaFileUpload(filename, resumable=True)
+
+            file = self.service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+
+            return file.get('id')
+
+        except HttpError as error:
+            log.error(f"An API error occurred during upload: {error}")
+        except FileNotFoundError:
+            log.error(f"Error: Local file not found at '{filename}'")
+
+        return None
+
+
+    def delete_file(self, fileID: str):
+        from googleapiclient.errors import HttpError
+        try:
+            self.service.files().delete(fileId=fileID).execute()
+            return True
+
+        except HttpError as error:
+            if error.resp.status == 404:
+                log.error(f"Error: File ID '{fileID}' not found.")
+            else:
+                log.error(f"An API error occurred during deletion: {error}")
+            return False
+        
+
+class Compressor:
+    def __init__(self, method: str = 'zstandard', level: int = 3):
+        self.method = method.lower()
+        self.level = level
+
+    def compress_world_zstd(self, folder: str, outputName: str, threads: int = -1) -> int:
+        """Compresses a Minecraft world folder into a .tar.zst archive.
+
+        Returns the size of the archive.
+        """
+        folderPath = Path(folder)
+        outputPath = Path(outputName)
+        actualThreads = os.cpu_count() or 4 if threads == -1 else threads
+
+        import tarfile
+
+        try:
+            import compression.zstd as zstd
+            options = {zstd.CompressionParameter.nb_workers: actualThreads, zstd.CompressionParameter.compression_level: self.level}
+            
+            with tarfile.open(outputPath, mode="w:zst", options=options) as tar:
+                tar.add(folderPath)
+
+        except (ImportError, AttributeError):
+            import zstandard as zstd
+            cctx = zstd.ZstdCompressor(level=self.level, threads=actualThreads)
+
+            with open(outputPath, "wb") as f_out:
+                with cctx.stream_writer(f_out) as compressor:
+                    with tarfile.open(
+                        fileobj=compressor, mode="w|", format=tarfile.PAX_FORMAT
+                    ) as tar:
+                        tar.add(folderPath, arcname=folderPath.name)
+                        
+        filesize = outputPath.stat().st_size
+        return filesize
+    
+    def compress_world_zip(self, folder: str, outputName: str) -> int:
+        """
+        Compresses a Minecraft world using built-in zipfile with fast DEFLATE (Level 2).
+
+        Returns the size of the archive.
+        """
+        import zipfile
+
+        folderPath = Path(folder)
+        outputPath = Path(outputName)
+
+        with zipfile.ZipFile(outputPath, "w", zipfile.ZIP_DEFLATED, compresslevel=self.level) as f:
+            for file in folderPath.rglob("*"):
+                if file.is_file():
+                    # Preserve folder structure inside the archive
+                    relativePath = file.relative_to(folderPath.parent)
+                    f.write(file, arcname=relativePath)
+
+        filesize = outputPath.stat().st_size
+
+        return filesize
+
+    def compress(self, folder: str, outputNameNoExt: str = None) -> tuple[str, int]:
+        if outputNameNoExt is None: 
+            outputNameNoExt = folder
+
+        if self.method == 'zstandard':
+            return (outputNameNoExt + '.tar.zstd', self.compress_world_zstd(folder, outputNameNoExt + '.tar.zstd'))
+        elif self.method == 'zip':
+            return (outputNameNoExt + '.zip', self.compress_world_zip(folder, outputNameNoExt + '.zip'))
+        else:
+            log.error("Error: Compress method is invalid")
+            return (None, -1)
 
 def compareVersion(version1: str, version2: str) -> int:
     v1 = list(map(int, version1.split('.')))
@@ -581,6 +774,8 @@ def load_config(path: str = CONFIG_FILENAME) -> dict:
                     config["_rcon_port"] = int(line.split("=", 1)[1].strip())
                 elif line.startswith("rcon.password="):
                     config["_rcon_password"] = line.split("=", 1)[1].strip()
+                elif line.startswith("level-name="):
+                    config["_world_folder"] = line.split("=", 1)[1].strip()
     if config["_rcon_enabled"]:
         log.info(f"RCON detected on port {config['_rcon_port']} (will use as stop fallback)")
 
@@ -690,17 +885,83 @@ def find_pid_by_port(port: int) -> int | None:
             return conn.pid
     return None
 
+backup_stage: str = "None"
+def start_backup(config: dict[str, str|int]):
+    """Starts backing up the server to Google Drive"""
+    global backup_stage, backup_time
+    try:
+        backup_stage = "Starting"
+
+        # Get previous compression data
+        if not os.path.exists('mass_backup_data.json'):
+            with open('mass_backup_data.json', 'x') as f:
+                f.write('[]')
+
+        with open('mass_backup_data.json', 'r') as f:
+            backupIDs: list[str] = json.load(f)
+
+        numOfBackups = len(backupIDs)
+        
+        # Compress world first before uploading
+        backup_stage = "Compressing"
+        compressor = Compressor(config.get('compression-method', 'zip'), config.get('compression-level', 3))
+        worldFolder = config['_world_folder']
+
+        filename, filesize = compressor.compress(worldFolder, config.get('backup-naming-scheme', 'backup{{ID}}').replace('{{ID}}', str(random.randint(1000000, 9999999))))
+
+        log.info(f"Compressed world folder '{worldFolder}' with a size of {(filesize / (1024**3)):.2f} GB")
+
+        # Upload to drive
+        backup_stage = "Getting credentials"
+        credfile = config.get('credentials_file', None)
+        if credfile is None or not os.path.exists(credfile):
+            log.warning(f"Credentials file '{credfile}' does not exist! Backup will not continue")
+            return False
+        
+        drive = DriveAPI(credfile)
+
+        # Delete previous backup if applicable
+        backup_stage = "Deleting old backups"
+        if numOfBackups >= config.get('max_backups', 1):
+            drive.delete_file(backupIDs.pop(0))
+
+        # Upload and save
+        backup_stage = f"Uploading ({round(filesize/(1024**2))} MB)"
+        fileID = drive.upload_file(filename, config['drive_folder_id'])
+        backupIDs.append(fileID)
+
+        with open('mass_backup_data.json', 'w') as f:
+            json.dump(backupIDs, f)
+
+        # Delete temp compressed folder
+        backup_stage = "Deleting temporary backup file"
+        os.remove(filename)
+        backup_stage = "Done"
+        log.info(f"Backup successful! Took {round(time.time() - backup_time, 1)}s to complete.")
+        backup_time = None
+        return True
+    except Exception as e:
+        log.error(f"An error occurred while backing up: {e}")
+        backup_stage = "Failed"
+        backup_time = None
+        return False
+        
+
 class ServerManager:
     def __init__(self, config: dict):
         self.config = config
         self._process: asyncio.subprocess.Process | None = None
         self._starting = False
         self._start_time: float | None = None
+        self._started_at: float | None = None
         self._ready_event = asyncio.Event()
         self._lock = asyncio.Lock()
         self._auto_stop_task: asyncio.Task | None = None
         # Cross-process startup lock (held while a server is in the startup phase).
         self._start_lock_fd: int | None = None
+        self.backup_time = None
+        self._playtime = 0
+        self._player_join_at = None
 
     def _acquire_start_lock(self) -> bool:
         """Try to acquire the cross-process startup lock. Returns True if held (or disabled)."""
@@ -848,6 +1109,23 @@ class ServerManager:
             return True
         except asyncio.TimeoutError:
             return False
+        
+    async def backup(self):
+        global backup_time
+
+        # Start backup
+        if self.config['backups']:
+            if ((self.config['auto_stop_empty_minutes'] is not None and self._playtime > 120) or self.config['auto_stop_empty_minutes'] is None):
+                log.info("Starting to backup the server")
+                backup_time = time.time()
+                threading.Thread(target = start_backup, args=(self.config, ), daemon=True).start()
+
+            else:
+                log.info(f"The backup did not start as there was no significant player activity detected (playtime was about {(round(self._playtime))}s)")
+
+        # Reset values
+        self._player_join_at = None
+        self._playtime = 0
 
     async def stop_server(self):
         """Stop the server: stdin -> RCON fallback -> kill."""
@@ -861,7 +1139,7 @@ class ServerManager:
                 log.info("Server stopped via stdin.")
                 self._process = None
                 self._ready_event.clear()
-                return
+                return await self.backup()
             log.warning("Server did not stop via stdin within 30s.")
 
         # Attempt 2: RCON (works even without a process handle)
@@ -872,17 +1150,17 @@ class ServerManager:
                     log.info("Server stopped via RCON.")
                     self._process = None
                     self._ready_event.clear()
-                    return
+                    return await self.backup()
                 log.warning("Server did not stop via RCON within 30s.")
             else:
                 # No process handle. Wait a bit then check if server is gone
                 log.info("No process handle, waiting for RCON stop to take effect...")
-                await asyncio.sleep(10)
+                await asyncio.sleep(20)
                 if not await self.is_running():
                     log.info("Server stopped via RCON.")
                     self._process = None
                     self._ready_event.clear()
-                    return
+                    return await self.backup()
                 log.warning("Server still running after RCON stop.")
 
         # Last resort: kill
@@ -911,6 +1189,9 @@ class ServerManager:
         self._process = None
         self._ready_event.clear()
         self._release_start_lock()
+        await self.backup()
+ 
+
 
     async def poll_until_ready(self):
         timeout = self.config.get("startup_timeout")
@@ -937,8 +1218,10 @@ class ServerManager:
                     times.append(duration)
                     save_startup_times(self.config["server_dir"], times)
                     self._start_time = None
+                    self._started_at = time.time()
                 else:
                     log.info("Server is ready!")
+                self._player_join_at = time.time() + 3 + self.config.get("auto_stop_poll_interval", 30)
                 self._starting = False
                 self._ready_event.set()
                 self._release_start_lock()
@@ -968,9 +1251,15 @@ class ServerManager:
                 continue
 
             if count == 0:
+                if self._player_join_at is not None:
+                    self._playtime += time.time() - self._player_join_at
+                    self._player_join_at = None
+
+
                 if empty_since is None:
                     empty_since = time.monotonic()
                     log.info("Auto-stop monitor: server is empty, starting countdown.")
+
                 elapsed = (time.monotonic() - empty_since) / 60.0
                 if elapsed >= empty_minutes:
                     log.info(f"Server has been empty for {elapsed:.1f}m, stopping.")
@@ -978,6 +1267,7 @@ class ServerManager:
                     return
             else:
                 if empty_since is not None:
+                    self._player_join_at = time.time()
                     log.info(f"Auto-stop monitor: {count} player(s) online, resetting countdown.")
                 empty_since = None
 
@@ -1139,6 +1429,8 @@ def save_verified_ips(ips: list[str]):
 verified_ips = load_verified_ips()
 
 async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, handshake_packet, protocol_version, config, server_mgr: ServerManager, addr, smdata, citydata):
+    global backup_time
+
     packet_id, login_data = await asyncio.wait_for(read_packet(reader), timeout=10)
     if packet_id != 0x00:
         return
@@ -1229,14 +1521,18 @@ async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         await send_disconnect_login(writer, config["kick_message_no_memory"])
         return
 
-    status = await server_mgr.trigger_start()
-    if status == "locked":
-        kick_msg = apply_placeholders(
-            config.get("kick_message_locked") or config["kick_message"],
-            config["server_dir"], server_mgr._start_time,
-        )
+    # Check if it is being backed up
+    if backup_time is not None:
+        kick_msg = config.get("backup_kick_message", "The server is being backed up. Please wait a moment before reconnecting.\nIt has currently taken {{BACKUP_TIME}}s").replace("{{BACKUP_TIME}}", str(round(time.time() - backup_time))).replace("{{BACKUP_STAGE}}", backup_stage)
     else:
-        kick_msg = apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)
+        status = await server_mgr.trigger_start()
+        if status == "locked":
+            kick_msg = apply_placeholders(
+                config.get("kick_message_locked") or config["kick_message"],
+                config["server_dir"], server_mgr._start_time,
+            )
+        else:
+            kick_msg = apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)
     await send_disconnect_login(writer, kick_msg)
 
 
