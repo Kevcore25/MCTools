@@ -22,6 +22,9 @@ pip install requests pyyaml cryptography google-auth google-auth-httplib2 google
 
 """
 Version updates:
+3.1.1:
+- For cloud backups, added a timeout to allow players to join while it is being backed up
+
 3.1:
 - Added cloud backup
 
@@ -245,6 +248,10 @@ drive_folder_id: null
 
 # Maximum backup amount (if this number is reached, the oldest backup is deleted)
 max_backups: 3
+
+# Backup timeout. When the timeout is reached, and a player tries to join the server, the server will allow the player to join the server.
+# Note that a force server start will NOT stop the backup - the backup will continue and the server will start.
+backup_timeout: 600
 
 # Backup kick message, when the server is being backed up.
 backup_kick_message: "\u00A77The server is being backed up.\\n\\nPlease wait a moment before reconnecting.\\n\\nCurrently taking {{BACKUP_TIME}}s | Stage: {{BACKUP_STAGE}}"
@@ -909,7 +916,7 @@ def start_backup(config: dict[str, str|int]):
 
         filename, filesize = compressor.compress(worldFolder, config.get('backup-naming-scheme', 'backup{{ID}}').replace('{{ID}}', str(random.randint(1000000, 9999999))))
 
-        log.info(f"Compressed world folder '{worldFolder}' with a size of {(filesize / (1024**3)):.2f} GB")
+        log.info(f"Compressed world folder '{worldFolder}' with a size of {(filesize / (1024**2)):.1f} MB")
 
         # Upload to drive
         backup_stage = "Getting credentials"
@@ -1522,7 +1529,7 @@ async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         return
 
     # Check if it is being backed up
-    if backup_time is not None:
+    if backup_time is not None and (time.time() - backup_time) < config.get('backup_timeout', 3600):
         kick_msg = config.get("backup_kick_message", "The server is being backed up. Please wait a moment before reconnecting.\nIt has currently taken {{BACKUP_TIME}}s").replace("{{BACKUP_TIME}}", str(round(time.time() - backup_time))).replace("{{BACKUP_STAGE}}", backup_stage)
     else:
         status = await server_mgr.trigger_start()
