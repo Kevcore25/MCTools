@@ -1,8 +1,35 @@
-VERSION = '1.1'
+VERSION = '1.2'
 
-import time, re, requests, yaml
+import socket
+""" CONFIG """
+# You can change the config in your file by changing the Config.CONFIG_NAME value
+class Config:
+    """
+    A class containing config values.
+    
+    You can directly edit these values in your file.
+    """
+    # Delay for watching for file changes in the log file, in seconds
+    # For the best responsiveness, this number should be less than or equal to 0.05 as Minecraft runs itself on 20 ticks per second (1 tick per 0.05s)
+    WATCH_DELAY = 0.05
+
+    # Whether to constantly check for a RCON connection.
+    # This constantly attempts to silently reconnect if disconnected, which can result in more resource usage.
+    # However, it should also improve connectivity, especially if the connection is closed
+    CHECK_FOR_CONNECTION = True
+
+    # Whether to print connection-related logs.
+    # Critical connection errors will still be printed. However, disabling this will print less
+    CONNECTION_LOGS = False
+
+    # All possible RCON IPs that the script tries
+    RCON_IPS = ["0.0.0.0", "127.0.0.1"] + [socket.gethostbyname_ex(socket.gethostname())[2]]
+
+""" END OF CONFIG """
+
+
+import time, re, requests, yaml, threading
 from traceback import print_exc
-
 """
 IMPORTED FROM MCRcon:
 """
@@ -10,7 +37,6 @@ IMPORTED FROM MCRcon:
 import argparse
 import getpass
 import os
-import socket
 import ssl
 import select
 import struct
@@ -134,71 +160,10 @@ class MCRcon(object):
             if len(select.select([self.socket], [], [], 0)[0]) == 0:
                 return in_data
 
-    def command(self, command):
+    def command(self, command: str):
         result = self._send(2, command)
         time.sleep(0.003)  # MC-72390 workaround
         return result
-
-
-def mcrcon_cli():
-    try:
-        parser = argparse.ArgumentParser(
-            description="connect to and use Minecraft Server remote console protocol"
-        )
-        parser.add_argument("host", metavar="HOST", help="the host to connect to")
-        parser.add_argument(
-            "--password",
-            metavar="PASSWORD",
-            help="the password to connect with, default is a prompt or envvar RCON_PASSWORD.",
-        )
-        parser.add_argument(
-            "-p",
-            "--port",
-            metavar="PORT",
-            dest="port",
-            type=int,
-            default=25575,
-            help="the port to connect to",
-        )
-        parser.add_argument(
-            "-t",
-            "--tls",
-            dest="tlsmode",
-            action="store_true",
-            help="connect to the server with tls encryption",
-        )
-        args = parser.parse_args()
-
-        if not args.password and not os.environ.get("RCON_PASSWORD"):
-            password = getpass.getpass("Password: ")
-        elif os.environ.get("RCON_PASSWORD"):
-            password = os.environ.get("RCON_PASSWORD")
-        else:
-            password = args.password
-
-        try:
-            with MCRcon(args.host, password, args.port, args.tlsmode) as mcr:
-                while True:
-                    cmd = input("> ")
-                    if cmd.strip() == "exit":
-                        break
-                    else:
-                        try:
-                            resp = mcr.command(cmd)
-                            print(resp)
-                        except (ConnectionResetError, ConnectionAbortedError):
-                            print(
-                                "The connection was terminated, the server may have been stopped."
-                            )
-                            break
-                        if cmd == "stop":
-                            break
-        except ConnectionRefusedError:
-            print("The connection could not be made as the server actively refused it.")
-        except ConnectionError as e:
-            print(e)
-    except KeyboardInterrupt:
-        pass
 
 """ END OF IMPORT """
 
@@ -303,6 +268,7 @@ class KMCE:
         self.advancementEvents = []
         self.lineEvents = []
         self.playerCmdTimes = {}
+        self.__currentIPIndex = 0
 
         self.entityDeaths = []
         self.serverCommands = {}
@@ -344,7 +310,7 @@ class KMCE:
 
     def expression(self, expression: str): 
         """
-        A decorator that runs when the playe's chat matches a regex expression.
+        A decorator that runs when the player's chat matches a regex expression.
 
         The function needs these parameters:
         
@@ -412,11 +378,14 @@ class KMCE:
 
                 match key:
                     case "rcon.port":
-                        self.PORT = int(value)
+                        self.__PORT = int(value)
                     case "rcon.password":
-                        self.PASSWORD = value
-
-            self.RCON = MCRcon('0.0.0.0', self.PASSWORD, self.PORT)
+                        self.__PASSWORD = value.rstrip('\n')
+                    case "server-ip":
+                        serverIP = value.rstrip('\n')
+                        if serverIP == "":
+                            serverIP = '0.0.0.0'
+            self.__RCON = MCRcon('0.0.0.0', self.__PASSWORD, self.__PORT)
         except FileNotFoundError:
             print("Unable to fetch the server.properties file from the current directory")
         except AttributeError:
@@ -424,6 +393,38 @@ class KMCE:
 
         # Get logs location
         self.LOGFILE = os.path.join(self.DIRECTORY, "logs", "latest.log")
+
+    def __try_next(self) -> bool:
+        """Attempts to try the next RCON IP and connect to it"""
+
+        # Refresh values just in case
+        self.store_config()
+
+        ips = Config.RCON_IPS
+
+        self.__currentIPIndex += 1
+        if self.__currentIPIndex >= len(ips):
+            self.__currentIPIndex = 0
+            self.__RCON = MCRcon(ips[self.__currentIPIndex], self.__PASSWORD, self.__PORT)
+            return False
+
+        try:
+            if Config.CONNECTION_LOGS:
+                print(f"Attempting to try {ips[self.__currentIPIndex]}...")
+            self.__RCON = MCRcon(ips[self.__currentIPIndex], self.__PASSWORD, self.__PORT)
+            self.__RCON.connect()
+            if len(self.__RCON.command("list")) == 0:
+                raise MCRconException("'list' command is empty")
+            if Config.CONNECTION_LOGS:
+                print("RCON IP switch successful")
+            return True
+        except MCRconException as e:
+            if Config.CONNECTION_LOGS:
+                print(f"Failed: {e}")
+            self.__try_next()
+
+    def get_rcon_ip(self) -> str:
+        return Config.RCON_IPS[self.__currentIPIndex]
 
     def cooldown(self, player: str, cooldown: float = 0.05) -> bool:
         """
@@ -549,7 +550,7 @@ class KMCE:
                 func(values)
 
         # Assuming vanilla mechanincs
-        elif " has made the advancement [":
+        elif " has made the advancement [" in line:
             text = line.split(': ', 1)[1]
 
             # Get the player and the advancement
@@ -565,23 +566,50 @@ class KMCE:
         for func in self.lineEvents:
             func(line)
 
+    def check_connection(self, retried = 0, lastMod = 0):
+        try:
+            mod = os.stat(self.LOGFILE).st_size
+
+            if lastMod != mod or retried > 12:
+                self.rcon_connect()
+                retried = -1
+
+            threading.Timer(10, self.check_connection, args=(retried+1, mod)).start()
+        except Exception:
+            if Config.CONNECTION_LOGS:
+                print_exc()
+            threading.Timer(60, self.check_connection, args=(retried+1, 0)).start()
+
+    def rcon_connect(self) -> bool:
+        try:
+            self.__RCON.connect()
+            return True
+        except MCRconException:
+            if Config.CONNECTION_LOGS:
+                print("RCON connection failed, trying other IPs")
+            return self.__try_next()
+
     def start(self):
-        lastMod = 0
-        seek = 0
+        lastMod = os.stat(self.LOGFILE).st_size
+        seek = lastMod
 
         try:
-            self.RCON.connect()
+            self.__RCON.connect()
             print("RCON connected.")
         except ConnectionError:
             print("Unable to connect to RCON. Commands will be disabled.")
         except AttributeError:
             print("No RCON is set up, so commands will not work.")
 
+        if Config.CHECK_FOR_CONNECTION:
+            self.check_connection()
+
         if not os.path.exists(self.LOGFILE):
             print(f"The log file ({self.LOGFILE}) cannot be found and this program cannot further continue.")
             exit()
 
         print("Starting watcher...")
+
 
         while True:
             try:
@@ -605,10 +633,10 @@ class KMCE:
 
                     lastMod = mod
 
-                time.sleep(0.05)
+                time.sleep(Config.WATCH_DELAY)
             except:
                 print_exc()
-                time.sleep(5)
+                time.sleep(3)
 
     def run(self, command: str) -> str:
         """
@@ -618,13 +646,15 @@ class KMCE:
         @param command: The command to run
         """
         try:
-            return self.RCON.command(command)
+            return self.__RCON.command(command)
         except (MCRconException):
             # Try connecting again
-            self.RCON.connect()
-            return self.RCON.command(command)
+            if self.rcon_connect():
+                return self.__RCON.command(command)
+            else:
+                return ''
 
-    def tellraw(self, player: str, components: dict) -> str:
+    def tellraw(self, player: str, components: dict) -> None:
         """
         Runs the tellraw command to the Minecraft server.
         Only works if RCON is enabled.
@@ -687,7 +717,7 @@ class KCKMCE(KMCE):
 
             self.tellraw(player, [
                 {"text": "\nYour KCash Balance:\nLocally (on this server): ", "color": "light_purple"}, {"score": {"name": player, "objective": "kcash"}, "color": "green"},
-                {"text": f"\nGlobally (on your account): ", "color": "light_purple"}, {"text": f"{bal}\n", "color": "green"},
+                {"text": f"\nGlobally (on your account): ", "color": "light_purple"}, {"text": f"{bal:>,}/1M\n", "color": "green"},
                 {"text": "Make sure to regularly .save!\n", "color": "gray", "italic": True}
             ])
 
@@ -701,7 +731,7 @@ class KCKMCE(KMCE):
             if r.get('success'):
                 self.run(f"scoreboard players set {player} kcash 0")
                 self.tellraw(player, [
-                    {"text": f"\nSuccessfully uploaded {bal} KCash to your global account!\n", "color": "green"}
+                    {"text": f"\nSuccessfully uploaded {bal} KCash to your global account!\nYou now have {r.get('output')} global KCash.\n", "color": "green"}
                 ])
             else:
                 self.tellraw(player, [
@@ -730,7 +760,36 @@ class KCKMCE(KMCE):
         # Shop system 
         def func(player: str, args: tuple[str]):
             """Shows the list of items that can be purchased"""
-            bal = request(f"READ bal FOR {player}").get("output", 0)
+
+            # Get balances
+            globalBal = request(f"READ bal FOR {player}").get("output", 0)
+            localBal = self.get_scoreboard(player, "kcash")
+
+            def ceil(num: float):
+                if num.is_integer():
+                    return int(num)
+                else:
+                    return int(num) + 1
+                
+            def compactNum(n: int) -> str:
+                if n > 1_000_000:
+                    return ">1M"
+                if n == 1_000_000:
+                    return "1M"
+                if n >= 1_000:
+                    val = ceil(n / 100.0) / 10.0
+                    return f"{int(val)}k" if val.is_integer() else f"{val}k"
+                return str(n)
+
+            def compactNumFloor(n: int) -> str:
+                if n > 1_000_000:
+                    return ">1M"
+                if n == 1_000_000:
+                    return "1M"
+                if n >= 1_000:
+                    val = int(n / 100.0) / 10.0
+                    return f"{int(val)}k" if val.is_integer() else f"{val}k"
+                return str(n)
 
             # Get page number
             if len(args) > 0 and args[0].isdigit():
@@ -748,10 +807,17 @@ class KCKMCE(KMCE):
                 with open('shop.yml', 'r') as f:
                     items: dict = yaml.safe_load(f)
             else:
-                self.tellraw(player, {"text": "\nThere is no shop set up on this server!\n", "color": "red"})
+                return self.tellraw(player, {"text": "\nThere is no shop set up on this server!\n", "color": "red"})
 
             # Send KCash shop heading
-            self.tellraw(player, {"text": "========= KCash Shop =========", "color": "light_purple"})
+            self.tellraw(player, [
+                {"text": "========= KCash Shop ==========", "color": "light_purple"},
+                {"text": f"\nYou currently have {compactNumFloor(globalBal)} KCash.\n", "color": "gray", "italic": True,
+                    "click_event":{"action":"suggest_command","command":f".kcash"}, 
+                    "hover_event":{"action":"show_text","value":[{"text": f"{globalBal} Global KCash", "color": "yellow"},{"text": f"\nOr {globalBal+localBal} ({compactNumFloor(globalBal+localBal)}) Total KCash", "color": "gray"}]}
+                }
+            ])
+ 
             
             itemKeys = list(items)
             for i in range(startI, endI):
@@ -766,18 +832,17 @@ class KCKMCE(KMCE):
                 self.tellraw(player, [
                     {"text": item['Name'], "color": "aqua" if item['Stock'] > 0 else "red",
                         "click_event":{"action":"suggest_command","command":f".buy {itemID}"},
-                        "hover_event":{"action":"show_text","value":[{"text": item['Description'], "color": "gray"},{"text":f"\nID: {itemID}\nCost: {item['Cost']} | Stock: {item['Stock']}", "color": "aqua"}]}
+                        "hover_event":{"action":"show_text","value":[{"text": item['Description'], "color": "gray"},{"text":f"\nID: {itemID}\nCost: {item['Cost']} | Stock available: {item['Stock']}", "color": "aqua"}]}
                     },
                     {"text": ": ", "color": "green"},
-                    {"text": f"{item['Cost']} KCash", "color": "yellow", 
+                    {"text": f"{compactNum(item['Cost'])} KCash", "color": ("yellow" if globalBal >= item['Cost'] else "#8c8651"), 
                         "click_event":{"action":"suggest_command","command":f".buy {itemID}"}, 
-                        "hover_event":{"action":"show_text","value":[{"text": "Click here to buy!", "color": "yellow"}]}
+                        "hover_event":{"action":"show_text","value":[{"text": f"Click here to buy! ({item['Cost']} KCash)", "color": "yellow"},{"text": f"\nCosts {round(item['Cost']/globalBal*100, 1) if globalBal != 0 else 'inf'}% of your balance.", "color": "gray", "italic": True}]}
                     }
                 ])
 
-            # Send ending message and page 
+            # Send ending message
             self.tellraw(player, [
-                {"text": f"You currently have {bal} KCash.\n", "color": "green"},
                 {"text": "======", "color": "light_purple"},
                 {"text": " << "} | ({"color": "yellow", "click_event":{"action":"suggest_command","command":f".shop {page - 1}"}} if page > 1 else {"color": "gray"}),
                 {"text": f"Pg. {page} out of {len(items) // ITEMS_PER_PAGE + 1}", "color": "light_purple"},
@@ -792,40 +857,47 @@ class KCKMCE(KMCE):
             """Purchase an item"""
 
             if len(args) == 0:
-                self.tellraw(player, {"text": "\nNo Item ID specified!\n", "color": "red"})
+                return self.tellraw(player, {"text": "\nNo Item ID specified!\n", "color": "red"})
 
             bal = int(request(f"READ bal FOR {player}").get("output", 0))
             itemID = args[0]
+
+            if len(args) == 2 and str(args[1]).isdigit():
+                amt = int(args[1])
+            else:
+                amt = 1
 
             # Check if it exists. If it doesn't, tell the player
             if os.path.exists('shop.yml'):
                 with open('shop.yml', 'r') as f:
                     items: dict = yaml.safe_load(f)
             else:
-                self.tellraw(player, {"text": "\nThere is no shop set up on this server!\n", "color": "red"})
+                return self.tellraw(player, {"text": "\nThere is no shop set up on this server!\n", "color": "red"})
 
             if itemID in items:
                 item = items[itemID]
                 # Check stock
-                if item['Stock'] <= 0:
-                    self.tellraw(player, {"text": f"\n{item['Name']} has ran out of stock!\n", "color": "red"})
+                if amt > item['Stock']:
+                    self.tellraw(player, {"text": f"\n{item['Name']} has ran out of stock!\n" + f"You can only buy up to {item['Stock']} of this item.\n" if item['Stock'] > 0 else "", "color": "red"})
 
                 # Check cost
-                elif bal < item['Cost']:
+                elif bal < item['Cost'] * amt:
                     self.tellraw(player, {"text": f"\nYou do not have enough KCash to purchase this item!\nYou need {item['Cost'] - bal} more KCash to buy this item!\n", "color": "red"})
 
                 else:
-                    r = request(f"ADD -{item['Cost']} FOR {player}")
+                    r = request(f"ADD -{item['Cost']*amt} FOR {player}")
                     if r.get('success'):
                         # Run command
-                        self.run(f"execute as {player} at @s run " + item['Command'])
+                        for i in range(amt):
+                            self.run(f"execute as {player} at @s run " + item['Command'])
 
-                        # Remove 1 from stock, and save it
-                        item['Stock'] -= 1
+                        # Remove AMT from stock, and save it
+                        item['Stock'] -= amt
+
                         with open('shop.yml', 'w') as f:
                             yaml.safe_dump(items, f)
 
-                        self.tellraw(player, {"text": f"\nSuccessfully bought {item['Name']} for {item['Cost']} KCash!\n", "color": "green"})
+                        self.tellraw(player, {"text": f"\nSuccessfully bought {amt} {item['Name']} for {item['Cost']*amt} KCash!\n", "color": "green"})
 
                     else:
                         self.tellraw(player, [
