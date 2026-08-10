@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-VERSION = '3.1.0'
+VERSION = '3.2'
 
 """
 Minecraft Adaptive Server Starter (MASS)!
@@ -22,6 +22,10 @@ pip install requests pyyaml cryptography google-auth google-auth-httplib2 google
 
 """
 Version updates:
+3.2:
+- Prioritizes whitelist/blacklist now (e.g. fix geoblock when whitelisted)
+- Allow local IPs to be passed (unless it is in the whitelist/blacklist) 
+
 3.1.1:
 - For cloud backups, added a timeout to allow players to join while it is being backed up
 
@@ -68,15 +72,17 @@ import psutil
 import yaml
 import random
 import threading
+import socket
 
 log = logging.getLogger("ServerStarter")
-
 
 CONFIG_FILENAME = "mass-config.yaml"
 VERIFIED_IPS_FILE = "verified_ips.json"
 
 STARTUP_TIMES_FILE = "startup_times.json"
 MAX_STORED_TIMES = 5
+
+LOCAL_IPS = ["0.0.0.0", "127.0.0.1"] + [socket.gethostbyname_ex(socket.gethostname())[2]]
 
 """
 DEFAULT CONFIG
@@ -1294,7 +1300,26 @@ async def handle_connection(
     if config["ip_listing_no_response"]:
         ip = addr[0]
         try:
+            # Whitelist/Blacklist check 
+            whitelist = config["ip_listing_whitelist"]
+            blacklist = config["ip_listing_blacklist"]
 
+            in_whitelist = in_blacklist = False
+
+            if whitelist or blacklist:
+                in_whitelist = any(fnmatch.fnmatch(ip, p) for p in whitelist)
+                in_blacklist = any(fnmatch.fnmatch(ip, p) for p in blacklist)
+
+            # Allow/Block whitelisted/blacklisted IPs
+            if in_whitelist:
+                raise UserWarning("in whitelist")
+            if in_blacklist:
+                raise ConnectionRefusedError(f"in blacklist")
+
+            # Allow local IPs
+            if ip in LOCAL_IPS:
+                raise UserWarning("local IP")
+            
             # Skip but warn if private
             if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("176.16."):
                 raise UserWarning("allowing private IP exception")
@@ -1309,24 +1334,17 @@ async def handle_connection(
 
                 if citydata["city"].lower() not in config["ip_listing_whitelist_city"] and citydata["region"].upper() not in config["ip_listing_whitelist_city"]: 
                     raise ConnectionRefusedError(f"not in whitelist city ({citydata['city']} | {citydata['region']})")
-                
-            # Whitelist/Blacklist check 
-            whitelist = config["ip_listing_whitelist"]
-            blacklist = config["ip_listing_blacklist"]
-
-            if whitelist or blacklist:
-                in_whitelist = any(fnmatch.fnmatch(ip, p) for p in whitelist)
-                in_blacklist = any(fnmatch.fnmatch(ip, p) for p in blacklist)
-
-                if not in_whitelist and in_blacklist:
-                    raise ConnectionRefusedError(f"in blacklist")
-                
+          
             # SmartMode
-            if config["ip_listing_smartmode"] and not in_whitelist:
+            if config["ip_listing_smartmode"]:
                 smdata = requests.get(f"https://api.sefinek.net/api/v2/ip-checker/{ip}").json()
+
                 # Autoblock Malicious and TOR
-                if smdata["malicious"] or smdata["tor"]:
+                if smdata["malicious"]:
                     raise ConnectionRefusedError(f"malicious")
+                if smdata["tor"]:
+                    raise ConnectionRefusedError(f"tor connection")
+
         except UserWarning:
             pass
         except ConnectionRefusedError as e:
