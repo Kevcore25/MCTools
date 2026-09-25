@@ -13,7 +13,7 @@ Typically, I do these steps in order:
 4. Run the adaptive starter, and then editing its config file
 5. Restart the adaptive starter and keep it running constantly
 
-I have a custom script that integrates all of my Minecraft servers together (`KMCEv3.py`) which I also leave runninmcr.py: A very basic script that uses mcrcon to connect to the server and run commands and see its real-time logs, essentially emulating the server's console when it does not exist.g; however, to make my scripts also accessible to others who may be interested, I left `KMCEv3.py` as a separate file on purpose instead of integrating it with the adaptive starter.
+I have a custom script that integrates all of my Minecraft servers together (`KMCEv3.py`) which I also leave running; however, to make my scripts also accessible to others who may be interested, I left `KMCEv3.py` as a separate file on purpose instead of integrating it with the adaptive starter.
 KMCEv3 itself has two classes (`KMCE` and `KCKMCE`) where `KCKMCE` is a superclass of `KMCE` that contains the integrations to my servers. For others, `KCKMCE` should not be used unless you plan to setup your own KMCE global server.
 
 ## What each script does
