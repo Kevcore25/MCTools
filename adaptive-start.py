@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-VERSION = '3.2'
+VERSION = '3.3'
 
 """
 Minecraft Adaptive Server Starter (MASS)!
@@ -22,6 +22,11 @@ pip install requests pyyaml cryptography google-auth google-auth-httplib2 google
 
 """
 Version updates:
+3.3:
+- Added the optional "limbo" join method for 1.20.5+
+- Transferred connections (handshake intent 3) are now accepted and passed to the server as normal logins
+- Backup options are expanded
+
 3.2:
 - Prioritizes whitelist/blacklist now (e.g. fix geoblock when whitelisted)
 - Allow local IPs to be passed (unless it is in the whitelist/blacklist) 
@@ -58,6 +63,7 @@ Version updates:
 
 import asyncio
 import base64
+import datetime
 import fcntl
 import fnmatch
 import os
@@ -73,6 +79,7 @@ import yaml
 import random
 import threading
 import socket
+import uuid as uuidlib
 
 log = logging.getLogger("ServerStarter")
 
@@ -164,6 +171,30 @@ starting_version_text: "\u00A7eWaking..."
 use_server_properties_motd: false
 
 # -------------------------------------------------------------------------
+# Join Method
+# What happens to a player who joins while the server is asleep / waking up.
+# -------------------------------------------------------------------------
+
+# kick:  the player is kicked with kick_message
+# limbo: for 1.20.5+, the player is placed into a fake server and is transferred when the server starts
+join_method: kick
+
+# Text shown in the fake server. Updated every second.
+# Placeholders available: {{ESTIMATED_TIME_REMAINING}} and {{ESTIMATED_TIME}}.
+limbo_title: "§eThis server is waking up..."
+limbo_subtitle: "§bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}"
+limbo_actionbar: "§7You will join automatically once it is ready"
+
+# Message when the server did not manage to start while players were waiting.
+limbo_failed_kick_message: "§4The server failed to start.§r\\n\\nPlease try again later."
+
+# Address players are transferred to once the server is ready.
+# Leave both as null to use the address the player joined with.
+# Set them if players join through an SRV record or a raw IP and the transfer does not bring them back.
+limbo_transfer_host: null
+limbo_transfer_port: null
+
+# -------------------------------------------------------------------------
 # Auto-stop & Timing
 # -------------------------------------------------------------------------
 
@@ -201,7 +232,6 @@ starting_icon: null
 auto_update: true
 auto_update_urls:
   - https://raw.githubusercontent.com/Kevcore25/MCTools/refs/heads/main/adaptive-start.py
-  - https://kaf.kcservers.ca/releases/mass.py
 
 # -------------------------------------------------------------------------
 # IP Listing
@@ -238,8 +268,6 @@ ip_listing_smartmode: true
 # Automatic backups (Google Drive)
 # -------------------------------------------------------------------------
 
-# Backups are uploaded to Google Drive in the naming scheme: backup{id}.ext
-
 # Enable backups. The world folder (found in server.properties) is backed up upon a server sleep under certain conditions.
 # If a player attempts to start the server while the server is backing up the world, the player is refused.
 # However, a player who already joined the server before can join back again, causing the backup to be stopped.
@@ -252,8 +280,21 @@ credentials_file: null
 # Google Drive Folder ID for the world to be backed up to
 drive_folder_id: null
 
-# Maximum backup amount (if this number is reached, the oldest backup is deleted)
-max_backups: 3
+# Backups are kept in three subfolders of drive_folder_id (created automatically):
+#   restart/ - the newest backups, one per server stop (or live backup)
+#   daily/   - the last backup of each day
+#   weekly/  - the last backup of each week
+# A backup is uploaded once and moved between folders as it ages. 0 disables a tier.
+backup_keep_restart: 3
+backup_keep_daily: 3
+backup_keep_weekly: 4
+
+# Also back up while the server keeps running (e.g. it has not stopped for days).
+# A live backup is taken when the newest backup is older than backup_live_interval_hours.
+# It uses save-off / save-all flush / save-on (via RCON if enabled, otherwise the console).
+# Players can keep playing and joining during a live backup.
+backup_while_running: true
+backup_live_interval_hours: 24
 
 # Backup timeout. When the timeout is reached, and a player tries to join the server, the server will allow the player to join the server.
 # Note that a force server start will NOT stop the backup - the backup will continue and the server will start.
@@ -262,9 +303,9 @@ backup_timeout: 600
 # Backup kick message, when the server is being backed up.
 backup_kick_message: "\u00A77The server is being backed up.\\n\\nPlease wait a moment before reconnecting.\\n\\nCurrently taking {{BACKUP_TIME}}s | Stage: {{BACKUP_STAGE}}"
 
-# Naming scheme. Placeholder {{ID}} generates a random number. 
-# Do not put file extensions (e.g. .zip) as they will automatically be added. 
-backup_naming_scheme: backup{{ID}}
+# Naming scheme. Placeholder {{ID}} generates a random number, {{DATE}} the date and time (YYYY-MM-DD_HHMM).
+# Do not put file extensions (e.g. .zip) as they will automatically be added.
+backup_naming_scheme: backup_{{DATE}}
 
 # Compression method. Available options: zstandard, zip
 # Zstandard allows for efficient compression as Minecraft region files already use it.
@@ -273,7 +314,7 @@ compression_method: zstandard
 
 # Level of compression. Higher numbers decrease file size but greatly increases the time required to compress.
 # It is recommended to keep it somewhat low (2-3) unless you really need the compression (5-9)
-compression_level: 3
+compression_level: 4
 """
 
 # Loaded once on import for fallback defaults (used by load_config + reload).
@@ -304,7 +345,7 @@ class DriveAPI:
                 creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(
-                    'credentials.json', ['https://www.googleapis.com/auth/drive'])
+                    self.credentials, ['https://www.googleapis.com/auth/drive'])
                 creds = flow.run_local_server(port=0)
 
             with open(tokenFile, 'wb') as token:
@@ -354,7 +395,55 @@ class DriveAPI:
             else:
                 log.error(f"An API error occurred during deletion: {error}")
             return False
-        
+
+    def ensure_folder(self, name: str, parent_id: str | None) -> str:
+        """Return the ID of the folder with this name under parent_id, creating it if needed."""
+        mime = 'application/vnd.google-apps.folder'
+        safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
+        query = f"name = '{safe_name}' and mimeType = '{mime}' and trashed = false"
+        if parent_id:
+            query += f" and '{parent_id}' in parents"
+        found = self.service.files().list(q=query, fields='files(id)', pageSize=1).execute().get('files', [])
+        if found:
+            return found[0]['id']
+        metadata = {'name': name, 'mimeType': mime}
+        if parent_id:
+            metadata['parents'] = [parent_id]
+        return self.service.files().create(body=metadata, fields='id').execute()['id']
+
+    def move_file(self, fileID: str, new_parent: str) -> bool:
+        """Move a file into a folder. Returns False if the file no longer exists."""
+        from googleapiclient.errors import HttpError
+        try:
+            parents = self.service.files().get(fileId=fileID, fields='parents').execute().get('parents', [])
+            if parents == [new_parent]:
+                return True
+            old_parents = ",".join(p for p in parents if p != new_parent)
+            self.service.files().update(
+                fileId=fileID, addParents=new_parent, removeParents=old_parents or None, fields='id'
+            ).execute()
+            return True
+        except HttpError as error:
+            if error.resp.status == 404:
+                log.error(f"Error: File ID '{fileID}' not found.")
+                return False
+            raise
+
+    def get_file_info(self, fileID: str) -> dict | None:
+        """Name and creation time (epoch seconds) of a file, or None if it does not exist."""
+        from googleapiclient.errors import HttpError
+        try:
+            info = self.service.files().get(fileId=fileID, fields='name,createdTime,trashed').execute()
+        except HttpError as error:
+            if error.resp.status == 404:
+                return None
+            raise
+        if info.get('trashed'):
+            return None
+        created = datetime.datetime.fromisoformat(info['createdTime'].replace('Z', '+00:00')).timestamp()
+        return {'name': info.get('name', ''), 'time': created}
+
+
 
 class Compressor:
     def __init__(self, method: str = 'zstandard', level: int = 3):
@@ -659,7 +748,7 @@ async def read_packet(reader: asyncio.StreamReader) -> tuple[int, bytes]:
     packet_id, offset = decode_varint(data)
     return packet_id, data[offset:]
 
-async def rcon_send(host: str, port: int, password: str, command: str) -> str | None:
+async def rcon_send(host: str, port: int, password: str, command: str, timeout: float = 5) -> str | None:
     """Connect to RCON, authenticate, send a command, and return the response."""
     try:
         reader, writer = await asyncio.wait_for(
@@ -696,7 +785,7 @@ async def rcon_send(host: str, port: int, password: str, command: str) -> str | 
         request_id += 1
         writer.write(_pack(request_id, 2, command))
         await writer.drain()
-        _, _, body = await asyncio.wait_for(_read_response(), timeout=5)
+        _, _, body = await asyncio.wait_for(_read_response(), timeout=timeout)
         writer.close()
         await writer.wait_closed()
         return body
@@ -744,6 +833,9 @@ def load_config(path: str = CONFIG_FILENAME) -> dict:
         with open(config_path) as f:
             user_config = yaml.safe_load(f) or {}
         config.update({k: v for k, v in user_config.items() if v is not None})
+        # Older configs only have max_backups: use it as the restart tier size
+        if user_config.get("max_backups") is not None and "backup_keep_restart" not in user_config:
+            config["backup_keep_restart"] = user_config["max_backups"]
     else:
         # Try migration of old to new config
         migrated = migrate_legacy_json(path)
@@ -898,67 +990,209 @@ def find_pid_by_port(port: int) -> int | None:
             return conn.pid
     return None
 
+BACKUP_DATA_FILE = 'mass_backup_data.json'
+BACKUP_TIERS = ('restart', 'daily', 'weekly')
+
+# Only one backup (stop or live) may compress/upload at a time.
+backup_lock = threading.Lock()
 backup_stage: str = "None"
-def start_backup(config: dict[str, str|int]):
-    """Starts backing up the server to Google Drive"""
-    global backup_stage, backup_time
+
+
+def plan_retention(backups: list[dict], keep_restart: int, keep_daily: int, keep_weekly: int) -> dict[str, str | None]:
+    """Decide which folder each backup belongs in, or None if it should be deleted.
+
+    restart: the newest keep_restart backups.
+    daily:   the newest backup of each of the newest keep_daily days.
+    weekly:  the newest backup of each of the newest keep_weekly ISO weeks.
+    A backup in several sets goes to the first of restart, daily, weekly.
+    """
+    ordered = sorted(backups, key=lambda b: b['time'], reverse=True)
+
+    def newest_per(key_fn, count: int) -> set[str]:
+        keep: set[str] = set()
+        seen: set = set()
+        for b in ordered:
+            key = key_fn(datetime.date.fromtimestamp(b['time']))
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(seen) > count:
+                break
+            keep.add(b['id'])
+        return keep
+
+    restart = {b['id'] for b in ordered[:max(0, keep_restart)]}
+    daily = newest_per(lambda d: d, max(0, keep_daily))
+    weekly = newest_per(lambda d: d.isocalendar()[:2], max(0, keep_weekly))
+
+    plan: dict[str, str | None] = {}
+    for b in ordered:
+        if b['id'] in restart:
+            plan[b['id']] = 'restart'
+        elif b['id'] in daily:
+            plan[b['id']] = 'daily'
+        elif b['id'] in weekly:
+            plan[b['id']] = 'weekly'
+        else:
+            plan[b['id']] = None
+    return plan
+
+
+def load_backup_data() -> dict:
+    """Read the backup records. The old format (a list of file IDs) is kept under 'legacy' for migration."""
+    data = {'version': 2, 'folders': {}, 'backups': []}
+    if not os.path.exists(BACKUP_DATA_FILE):
+        return data
     try:
-        backup_stage = "Starting"
+        with open(BACKUP_DATA_FILE, 'r') as f:
+            stored = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        log.warning(f"Could not read {BACKUP_DATA_FILE} ({e}); starting with no backup records")
+        return data
+    if isinstance(stored, list):
+        data['legacy'] = [i for i in stored if isinstance(i, str)]
+    elif isinstance(stored, dict):
+        data['folders'] = stored.get('folders') or {}
+        data['backups'] = stored.get('backups') or []
+    return data
 
-        # Get previous compression data
-        if not os.path.exists('mass_backup_data.json'):
-            with open('mass_backup_data.json', 'x') as f:
-                f.write('[]')
 
-        with open('mass_backup_data.json', 'r') as f:
-            backupIDs: list[str] = json.load(f)
+def save_backup_data(data: dict):
+    out = {'version': 2, 'folders': data.get('folders', {}), 'backups': data.get('backups', [])}
+    if data.get('legacy'):
+        out['legacy'] = data['legacy']
+    with open(BACKUP_DATA_FILE, 'w') as f:
+        json.dump(out, f, indent=2)
 
-        numOfBackups = len(backupIDs)
-        
-        # Compress world first before uploading
-        backup_stage = "Compressing"
-        compressor = Compressor(config.get('compression-method', 'zip'), config.get('compression-level', 3))
-        worldFolder = config['_world_folder']
 
-        filename, filesize = compressor.compress(worldFolder, config.get('backup-naming-scheme', 'backup{{ID}}').replace('{{ID}}', str(random.randint(1000000, 9999999))))
+def last_backup_time() -> float | None:
+    """Time of the newest recorded backup, if any."""
+    times = [b['time'] for b in load_backup_data()['backups']]
+    return max(times) if times else None
 
-        log.info(f"Compressed world folder '{worldFolder}' with a size of {(filesize / (1024**2)):.1f} MB")
 
-        # Upload to drive
+def apply_retention(drive: "DriveAPI", data: dict, config: dict):
+    """Move backups between the tier folders and delete the ones no tier keeps."""
+    plan = plan_retention(
+        data['backups'],
+        int(config.get('backup_keep_restart') or 0),
+        int(config.get('backup_keep_daily') or 0),
+        int(config.get('backup_keep_weekly') or 0),
+    )
+    kept = []
+    for b in data['backups']:
+        target = plan[b['id']]
+        if target is None:
+            log.info(f"Deleting old backup {b.get('name') or b['id']}")
+            drive.delete_file(b['id'])
+            continue
+        if target != b.get('folder'):
+            log.info(f"Moving backup {b.get('name') or b['id']} to {target}/")
+            if not drive.move_file(b['id'], data['folders'][target]):
+                continue  # Deleted on Drive by hand
+            b['folder'] = target
+        kept.append(b)
+    data['backups'] = kept
+
+
+def compress_world(config: dict) -> tuple[str, int]:
+    """Compress the world folder into a local archive. Returns (filename, size)."""
+    method = str(config.get('compression_method') or 'zstandard')
+    level = int(config.get('compression_level') or 3)
+    scheme = str(config.get('backup_naming_scheme') or 'backup_{{DATE}}_{{ID}}')
+    name = (scheme.replace('{{ID}}', str(random.randint(1000000, 9999999)))
+                  .replace('{{DATE}}', datetime.datetime.now().strftime('%Y-%m-%d_%H%M')))
+    world = config['_world_folder']
+
+    try:
+        filename, size = Compressor(method, level).compress(world, name)
+    except ImportError:
+        log.warning("Zstandard is not available (pip install zstandard); falling back to zip for this backup")
+        filename, size = Compressor('zip', level).compress(world, name)
+    if filename is None:
+        raise ValueError(f"Invalid compression_method '{method}'")
+    log.info(f"Compressed world folder '{world}' with a size of {(size / (1024**2)):.1f} MB")
+    return filename, size
+
+
+def upload_backup(config: dict, filename: str, filesize: int) -> bool:
+    """Upload a compressed world to the restart/ folder, then reorganize older backups."""
+    global backup_stage
+    try:
         backup_stage = "Getting credentials"
         credfile = config.get('credentials_file', None)
         if credfile is None or not os.path.exists(credfile):
             log.warning(f"Credentials file '{credfile}' does not exist! Backup will not continue")
             return False
-        
         drive = DriveAPI(credfile)
+        data = load_backup_data()
 
-        # Delete previous backup if applicable
-        backup_stage = "Deleting old backups"
-        if numOfBackups >= config.get('max_backups', 1):
-            drive.delete_file(backupIDs.pop(0))
+        backup_stage = "Preparing folders"
+        root = config.get('drive_folder_id')
+        data['folders'] = {tier: drive.ensure_folder(tier, root) for tier in BACKUP_TIERS}
 
-        # Upload and save
+        # Backups made by MASS 3.3 and older: give them a record and move them into restart/
+        legacy = data.pop('legacy', [])
+        if legacy:
+            log.info(f"Moving {len(legacy)} backup(s) from the old format into restart/")
+        for file_id in legacy:
+            info = drive.get_file_info(file_id)
+            if info is None or not drive.move_file(file_id, data['folders']['restart']):
+                continue
+            data['backups'].append({'id': file_id, 'name': info['name'], 'time': info['time'], 'folder': 'restart'})
+
         backup_stage = f"Uploading ({round(filesize/(1024**2))} MB)"
-        fileID = drive.upload_file(filename, config['drive_folder_id'])
-        backupIDs.append(fileID)
+        created = time.time()
+        file_id = drive.upload_file(filename, data['folders']['restart'])
+        if file_id:
+            data['backups'].append({'id': file_id, 'name': os.path.basename(filename), 'time': created, 'folder': 'restart'})
 
-        with open('mass_backup_data.json', 'w') as f:
-            json.dump(backupIDs, f)
-
-        # Delete temp compressed folder
+        backup_stage = "Organizing old backups"
+        apply_retention(drive, data, config)
+        save_backup_data(data)
+        return bool(file_id)
+    finally:
         backup_stage = "Deleting temporary backup file"
-        os.remove(filename)
+        try:
+            os.remove(filename)
+        except OSError:
+            pass
+
+
+def start_backup(config: dict[str, str|int]):
+    """Back up the stopped server to Google Drive (runs in a thread)."""
+    global backup_stage, backup_time
+    started = backup_time or time.time()
+    try:
+        backup_stage = "Waiting for another backup"
+        with backup_lock:
+            backup_stage = "Compressing"
+            filename, filesize = compress_world(config)
+            if not upload_backup(config, filename, filesize):
+                backup_stage = "Failed"
+                return False
         backup_stage = "Done"
-        log.info(f"Backup successful! Took {round(time.time() - backup_time, 1)}s to complete.")
-        backup_time = None
+        log.info(f"Backup successful! Took {round(time.time() - started, 1)}s to complete.")
         return True
     except Exception as e:
         log.error(f"An error occurred while backing up: {e}")
         backup_stage = "Failed"
-        backup_time = None
         return False
-        
+    finally:
+        backup_time = None
+
+
+def upload_live_backup(config: dict, filename: str, filesize: int):
+    """Thread body for a live backup: upload, then release the backup lock taken by the caller."""
+    started = time.time()
+    try:
+        if upload_backup(config, filename, filesize):
+            log.info(f"Live backup uploaded! Took {round(time.time() - started, 1)}s.")
+    except Exception as e:
+        log.error(f"An error occurred while uploading the live backup: {e}")
+    finally:
+        backup_lock.release()
+
 
 class ServerManager:
     def __init__(self, config: dict):
@@ -970,6 +1204,7 @@ class ServerManager:
         self._ready_event = asyncio.Event()
         self._lock = asyncio.Lock()
         self._auto_stop_task: asyncio.Task | None = None
+        self._live_backup_task: asyncio.Task | None = None
         # Cross-process startup lock (held while a server is in the startup phase).
         self._start_lock_fd: int | None = None
         self.backup_time = None
@@ -1140,6 +1375,87 @@ class ServerManager:
         self._player_join_at = None
         self._playtime = 0
 
+    def _current_playtime(self) -> float:
+        """Player time since the last backup, including a session still in progress."""
+        playtime = self._playtime
+        if self._player_join_at is not None:
+            playtime += max(0.0, time.time() - self._player_join_at)
+        return playtime
+
+    async def _world_command(self, command: str, wait: float = 0) -> bool:
+        """Run a command on the server (RCON if enabled, otherwise the console).
+
+        With a console-only server there is no reply, so `wait` seconds are waited instead.
+        """
+        if self.config.get("_rcon_enabled"):
+            result = await rcon_send(
+                "127.0.0.1", self.config["_rcon_port"], self.config["_rcon_password"], command,
+                timeout=max(5, wait * 20),
+            )
+            if result is not None:
+                return True
+        if self._process and self._process.stdin and self._process.returncode is None:
+            await self.send_command(command)
+            if wait:
+                await asyncio.sleep(wait)
+            return True
+        return False
+
+    async def live_backup_monitor(self):
+        """Back up the world while the server keeps running, once per backup_live_interval_hours."""
+        poll_interval = self.config.get("auto_stop_poll_interval", 30)
+        reference = time.time()  # Used if the server was never started or backed up by MASS
+        while True:
+            await asyncio.sleep(poll_interval)
+            if not (self.config.get("backups") and self.config.get("backup_while_running")):
+                continue
+            try:
+                interval = float(self.config.get("backup_live_interval_hours") or 0) * 3600
+            except (TypeError, ValueError):
+                continue
+            if interval <= 0 or not self._ready_event.is_set() or not await self.is_running():
+                continue
+
+            since = max(t for t in (last_backup_time(), self._started_at, reference) if t is not None)
+            if time.time() - since < interval:
+                continue
+            if self.config.get("auto_stop_empty_minutes") is not None and self._current_playtime() <= 120:
+                # Nothing was played since the last backup; check again in one interval
+                reference = time.time()
+                continue
+            if await self.live_backup():
+                reference = time.time()
+
+    async def live_backup(self) -> bool:
+        """save-off, save-all flush, compress, save-on, then upload in the background."""
+        if not backup_lock.acquire(blocking=False):
+            log.info("Live backup skipped: another backup is still running")
+            return False
+        handed_off = False
+        try:
+            log.info("Starting a live backup of the running server")
+            if not await self._world_command("save-off"):
+                log.warning("Live backup skipped: cannot send commands to the server (enable RCON or let MASS start the server)")
+                return False
+            try:
+                await self._world_command("save-all flush", wait=15)
+                # Reset now: play after this point belongs to the next backup
+                self._playtime = 0
+                if self._player_join_at is not None:
+                    self._player_join_at = time.time()
+                filename, filesize = await asyncio.to_thread(compress_world, self.config)
+            finally:
+                await self._world_command("save-on")
+            threading.Thread(target=upload_live_backup, args=(self.config, filename, filesize), daemon=True).start()
+            handed_off = True
+            return True
+        except Exception as e:
+            log.error(f"An error occurred during the live backup: {e}")
+            return False
+        finally:
+            if not handed_off:
+                backup_lock.release()
+
     async def stop_server(self):
         """Stop the server: stdin -> RCON fallback -> kill."""
         has_process = self._process is not None and self._process.returncode is None
@@ -1241,6 +1557,9 @@ class ServerManager:
                 # Start auto-stop monitor
                 if self._auto_stop_task is None or self._auto_stop_task.done():
                     self._auto_stop_task = asyncio.create_task(self.auto_stop_monitor())
+                # Start live backup monitor
+                if self._live_backup_task is None or self._live_backup_task.done():
+                    self._live_backup_task = asyncio.create_task(self.live_backup_monitor())
                 return
 
     async def auto_stop_monitor(self):
@@ -1283,6 +1602,464 @@ class ServerManager:
                     self._player_join_at = time.time()
                     log.info(f"Auto-stop monitor: {count} player(s) online, resetting countdown.")
                 empty_since = None
+
+
+# =============================================================================
+# Limbo (fake waiting server)
+#
+# Used when join_method is "limbo". MASS completes an offline-style login itself,
+# puts the player in an empty world, shows the time remaining in the title and
+# action bar, and transfers the player to the real server once it is ready.
+# Only Minecraft 1.20.5+ is supported, since older clients have no Transfer packet;
+# every other version gets the classic kick.
+# =============================================================================
+
+# Protocol numbers where behaviour changes
+PROTO_1_20_5 = 766   # Transfer packet, known packs (first supported version)
+PROTO_1_21 = 767
+PROTO_1_21_2 = 768
+PROTO_1_21_5 = 770
+PROTO_1_21_9 = 773
+PROTO_1_21_11 = 774
+PROTO_26_1 = 775
+PROTO_26_2 = 776
+PROTO_26_3 = 777
+
+# Clientbound Play packet IDs for every supported protocol version.
+LIMBO_PLAY_IDS: dict[int, dict[str, int]] = {}
+
+
+def _limbo_ids(protocols, join, pos, keepalive, abilities, spawn, event, disconnect,
+               title, subtitle, actionbar, times, transfer):
+    for p in protocols:
+        LIMBO_PLAY_IDS[p] = {
+            "join": join, "pos": pos, "keepalive": keepalive, "abilities": abilities,
+            "spawn": spawn, "event": event, "disconnect": disconnect, "title": title,
+            "subtitle": subtitle, "actionbar": actionbar, "times": times, "transfer": transfer,
+        }
+
+
+#           protocols                      join  pos   keep  abil  spawn event disc  title sub   abar  times transfer
+_limbo_ids((766, 767),                     0x2B, 0x40, 0x26, 0x38, 0x56, 0x22, 0x1D, 0x65, 0x63, 0x4C, 0x66, 0x73)  # 1.20.5 - 1.21.1
+_limbo_ids((768, 769),                     0x2C, 0x42, 0x27, 0x3A, 0x5B, 0x23, 0x1D, 0x6C, 0x6A, 0x51, 0x6D, 0x7A)  # 1.21.2 - 1.21.4
+_limbo_ids((770, 771, 772),                0x2B, 0x41, 0x26, 0x39, 0x5A, 0x22, 0x1C, 0x6B, 0x69, 0x50, 0x6C, 0x7A)  # 1.21.5 - 1.21.8
+_limbo_ids((773, 774),                     0x30, 0x46, 0x2B, 0x3E, 0x5F, 0x26, 0x20, 0x70, 0x6E, 0x55, 0x71, 0x7F)  # 1.21.9 - 1.21.11
+_limbo_ids((775, 776),                     0x31, 0x48, 0x2C, 0x40, 0x61, 0x26, 0x20, 0x72, 0x70, 0x57, 0x73, 0x81)  # 26.1.x, 26.2
+_limbo_ids((777,),                         0x32, 0x49, 0x2D, 0x41, 0x63, 0x27, 0x20, 0x74, 0x72, 0x59, 0x75, 0x84)  # 26.3
+
+# Game versions sharing each protocol number. The client only uses its built-in
+# registry data if the "minecraft:core" pack version matches its own version
+# exactly, so every candidate is offered and the client picks its own.
+LIMBO_CORE_PACKS: dict[int, tuple[str, ...]] = {
+    766: ("1.20.5", "1.20.6"),
+    767: ("1.21", "1.21.1"),
+    768: ("1.21.2", "1.21.3"),
+    769: ("1.21.4",),
+    770: ("1.21.5",),
+    771: ("1.21.6",),
+    772: ("1.21.7", "1.21.8"),
+    773: ("1.21.9", "1.21.10"),
+    774: ("1.21.11",),
+    775: ("26.1", "26.1.1", "26.1.2"),
+    776: ("26.2",),
+    777: ("26.3",),
+}
+
+LIMBO_WORLD = "minecraft:overworld"
+LIMBO_GAMEMODE = 3      # Spectator: no HUD clutter and no falling
+LIMBO_SPAWN_Y = 400     # Above the build limit, so no chunks need to be sent
+
+_DAMAGE_TYPES_1_20_5 = (
+    "arrow", "bad_respawn_point", "cactus", "cramming", "dragon_breath", "drown", "dry_out",
+    "explosion", "fall", "falling_anvil", "falling_block", "falling_stalactite", "fireball",
+    "fireworks", "fly_into_wall", "freeze", "generic", "generic_kill", "hot_floor", "in_fire",
+    "in_wall", "indirect_magic", "lava", "lightning_bolt", "magic", "mob_attack",
+    "mob_attack_no_aggro", "mob_projectile", "on_fire", "out_of_world", "outside_border",
+    "player_attack", "player_explosion", "sonic_boom", "spit", "stalagmite", "starve", "sting",
+    "sweet_berry_bush", "thorns", "thrown", "trident", "unattributed_fireball", "wither",
+    "wither_skull",
+)
+
+_SULFUR_CUBE_ARCHETYPES = (
+    "bouncy", "explosive", "fast_flat", "fast_sliding", "high_resistance", "hot", "light",
+    "regular", "slow_bouncy", "slow_flat", "slow_sliding", "sticky",
+)
+
+
+def limbo_damage_types(protocol: int) -> list[str]:
+    """Vanilla damage type names for a protocol version."""
+    names = list(_DAMAGE_TYPES_1_20_5)
+    if protocol >= PROTO_1_21:
+        names += ["campfire", "wind_charge"]
+    if protocol >= PROTO_1_21_2:
+        names += ["ender_pearl", "mace_smash"]
+    if protocol >= PROTO_1_21_11:
+        names += ["spear"]
+    if protocol >= PROTO_26_2:
+        names += ["sulfur_cube_hot"]
+    return names
+
+
+# ----- Encoders --------------------------------------------------------------
+
+def enc_bool(value: bool) -> bytes:
+    return b"\x01" if value else b"\x00"
+
+
+def enc_i8(value: int) -> bytes:
+    return struct.pack(">b", value)
+
+
+def enc_u8(value: int) -> bytes:
+    return struct.pack(">B", value)
+
+
+def enc_i32(value: int) -> bytes:
+    return struct.pack(">i", value)
+
+
+def enc_i64(value: int) -> bytes:
+    return struct.pack(">q", value)
+
+
+def enc_f32(value: float) -> bytes:
+    return struct.pack(">f", value)
+
+
+def enc_f64(value: float) -> bytes:
+    return struct.pack(">d", value)
+
+
+def enc_position(x: int, y: int, z: int) -> bytes:
+    """Packed block position."""
+    value = ((x & 0x3FFFFFF) << 38) | ((z & 0x3FFFFFF) << 12) | (y & 0xFFF)
+    return struct.pack(">Q", value)
+
+
+def _nbt_string(text: str) -> bytes:
+    """NBT strings use Java's modified UTF-8 with an unsigned short length."""
+    out = bytearray()
+    raw = text.encode("utf-16-be", "surrogatepass")
+    for i in range(0, len(raw), 2):
+        unit = (raw[i] << 8) | raw[i + 1]
+        if unit == 0:
+            out += b"\xc0\x80"
+        elif unit < 0x80:
+            out.append(unit)
+        elif unit < 0x800:
+            out += bytes((0xC0 | (unit >> 6), 0x80 | (unit & 0x3F)))
+        else:
+            out += bytes((0xE0 | (unit >> 12), 0x80 | ((unit >> 6) & 0x3F), 0x80 | (unit & 0x3F)))
+    return struct.pack(">H", len(out)) + bytes(out)
+
+
+def encode_text(text: str) -> bytes:
+    """Text component for Play/Configuration packets: a nameless NBT string tag."""
+    return b"\x08" + _nbt_string(text)
+
+
+# ----- Registries ------------------------------------------------------------
+
+def limbo_registries(protocol: int) -> list[tuple[str, list[str]]]:
+    """Registries and entry names.
+
+    Only names are sent; the client fills in the data from its own "minecraft:core" pack.
+    """
+    climate = ["cold", "temperate", "warm"]
+    reg: dict[str, list[str]] = {
+        "dimension_type": ["overworld"],
+        "worldgen/biome": ["plains"],
+        "damage_type": limbo_damage_types(protocol),
+        "wolf_variant": ["ashen", "black", "chestnut", "pale", "rusty", "snowy", "spotted", "striped", "woods"],
+    }
+    if protocol >= PROTO_1_21:
+        reg["painting_variant"] = ["kebab"]
+    if protocol >= PROTO_1_21_5:
+        reg["cat_variant"] = ["all_black", "black", "british_shorthair", "calico", "jellie", "persian",
+                              "ragdoll", "red", "siamese", "tabby", "white"]
+        reg["chicken_variant"] = climate
+        reg["cow_variant"] = climate
+        reg["frog_variant"] = climate
+        reg["pig_variant"] = climate
+        reg["wolf_sound_variant"] = ["angry", "big", "classic", "cute", "grumpy", "puglin", "sad"]
+    if protocol >= PROTO_1_21_11:
+        reg["zombie_nautilus_variant"] = ["temperate", "warm"]
+        reg["timeline"] = ["day", "early_game", "moon", "villager_schedule"]
+    if protocol >= PROTO_26_1:
+        reg["cat_sound_variant"] = ["classic", "royal"]
+        reg["chicken_sound_variant"] = ["classic", "picky"]
+        reg["cow_sound_variant"] = ["classic", "moody"]
+        reg["pig_sound_variant"] = ["big", "classic", "mini"]
+        reg["world_clock"] = ["overworld", "the_end"]
+        reg["instrument"] = ["ponder_goat_horn"]
+        reg["jukebox_song"] = ["11", "13", "5", "blocks", "cat", "chirp", "creator", "creator_music_box",
+                               "far", "lava_chicken", "mall", "mellohi", "otherside", "pigstep", "precipice",
+                               "relic", "stal", "strad", "tears", "wait", "ward"]
+        reg["trim_material"] = ["amethyst", "copper", "diamond", "emerald", "gold", "iron", "lapis",
+                                "netherite", "quartz", "redstone", "resin"]
+        reg["banner_pattern"] = ["base"]
+    if protocol >= PROTO_26_2:
+        reg["jukebox_song"] = reg["jukebox_song"] + ["bounce"]
+        reg["sulfur_cube_archetype"] = list(_SULFUR_CUBE_ARCHETYPES)
+    if protocol >= PROTO_26_3:
+        reg["block_transformer"] = ["axe", "hoe", "shovel"]
+        reg["decorated_pot_pattern"] = ["angler", "archer", "arms_up", "blade", "brewer", "burn", "danger",
+                                        "explorer", "flow", "friend", "guster", "heart", "heartbreak", "howl",
+                                        "miner", "mourner", "plenty", "prize", "scrape", "sheaf", "shelter",
+                                        "skull", "snort"]
+    return [("minecraft:" + name, ["minecraft:" + e for e in entries]) for name, entries in reg.items()]
+
+
+def limbo_tags(protocol: int) -> list[tuple[str, list[str]]]:
+    """Tags newer clients expect to exist (1.21.11+). They are sent empty."""
+    tags: dict[str, list[str]] = {}
+    if protocol >= PROTO_1_21_11:
+        tags["timeline"] = ["in_overworld", "in_nether", "in_end", "universal"]
+    if protocol >= PROTO_26_1:
+        tags["banner_pattern"] = ["no_item_required"] + [
+            "pattern_item/" + n for n in ("bordure_indented", "creeper", "field_masoned", "flow", "flower",
+                                          "globe", "guster", "mojang", "piglin", "skull")
+        ]
+        tags["damage_type"] = ["bypasses_shield", "is_explosion", "is_fire"]
+    if protocol >= PROTO_26_2:
+        tags["block"] = ["infiniburn_overworld", "infiniburn_nether", "infiniburn_end"]
+        # Each sulfur cube archetype refers to an item tag of the same name; tags are
+        # never taken from the client's built-in pack, so they have to be sent.
+        tags["item"] = ["sulfur_cube_archetype/" + n for n in _SULFUR_CUBE_ARCHETYPES]
+    return [("minecraft:" + name, ["minecraft:" + t for t in names]) for name, names in tags.items()]
+
+
+# ----- Packet builders -------------------------------------------------------
+
+def parse_login_start_uuid(data: bytes) -> uuidlib.UUID | None:
+    """Return the UUID the client sent in Login Start (name, then UUID)."""
+    try:
+        _name, offset = decode_string(data)
+        raw = data[offset : offset + 16]
+        return uuidlib.UUID(bytes=raw) if len(raw) == 16 else None
+    except (IndexError, ValueError):
+        return None
+
+
+def build_login_success(protocol: int, player_uuid: uuidlib.UUID, name: str) -> bytes:
+    out = player_uuid.bytes + encode_string(name) + encode_varint(0)  # No profile properties
+    if protocol <= PROTO_1_21:
+        out += enc_bool(False)  # Strict error handling
+    if protocol >= PROTO_26_2:
+        out += uuidlib.uuid4().bytes  # Session ID
+    return out
+
+
+def build_join_game(protocol: int) -> bytes:
+    gm = LIMBO_GAMEMODE
+    entity_id = enc_i32(1)  # 26.2+ rejects entity ID 0
+    world = encode_string(LIMBO_WORLD)
+    no, yes = enc_bool(False), enc_bool(True)
+
+    out = (entity_id + no + encode_varint(1) + world + encode_varint(1) + encode_varint(2) + encode_varint(2)
+           + no + yes + no)  # reducedDebugInfo, enableRespawnScreen, doLimitedCrafting
+    out += encode_varint(0)  # Dimension type: index into the registry
+    out += world + enc_i64(0)
+    if protocol >= PROTO_26_3:
+        out += encode_varint(gm) + encode_varint(0)  # 0 = no previous game mode
+    else:
+        out += enc_u8(gm) + enc_i8(-1)
+    out += no + yes + no + encode_varint(0)  # isDebug, isFlat, no death location, portal cooldown
+    if protocol >= PROTO_1_21_2:
+        out += encode_varint(63)  # Sea level
+    if protocol >= PROTO_26_2:
+        out += no  # Online mode
+    out += no  # Enforces secure chat
+    return out
+
+
+def build_position(protocol: int) -> bytes:
+    x, y, z = 0.5, float(LIMBO_SPAWN_Y), 0.5
+    if protocol >= PROTO_1_21_2:
+        return (encode_varint(1) + enc_f64(x) + enc_f64(y) + enc_f64(z)
+                + enc_f64(0) + enc_f64(0) + enc_f64(0) + enc_f32(0) + enc_f32(0) + enc_i32(0))
+    return enc_f64(x) + enc_f64(y) + enc_f64(z) + enc_f32(0) + enc_f32(0) + enc_i8(0) + encode_varint(1)
+
+
+def build_spawn_position(protocol: int) -> bytes:
+    pos = enc_position(0, LIMBO_SPAWN_Y, 0)
+    if protocol >= PROTO_1_21_9:
+        return encode_string(LIMBO_WORLD) + pos + enc_f32(0) + enc_f32(0)
+    return pos + enc_f32(0)
+
+
+def build_title_packets(ids: dict, title: str, subtitle: str, actionbar: str) -> bytes:
+    """Title timing, subtitle, title and action bar packets."""
+    times = enc_i32(0) + enc_i32(60) + enc_i32(20)  # Fade in, stay, fade out (ticks)
+    return (make_packet(ids["times"], times)
+            + make_packet(ids["subtitle"], encode_text(subtitle))
+            + make_packet(ids["title"], encode_text(title))
+            + make_packet(ids["actionbar"], encode_text(actionbar)))
+
+
+def build_known_packs(protocol: int) -> bytes:
+    versions = LIMBO_CORE_PACKS[protocol]
+    out = encode_varint(len(versions))
+    for version in versions:
+        out += encode_string("minecraft") + encode_string("core") + encode_string(version)
+    return out
+
+
+def build_registry_data(registry: str, entries: list[str]) -> bytes:
+    out = encode_string(registry) + encode_varint(len(entries))
+    for entry in entries:
+        out += encode_string(entry) + enc_bool(False)  # No data: use the client's built-in pack
+    return out
+
+
+def build_update_tags(tags: list[tuple[str, list[str]]]) -> bytes:
+    out = encode_varint(len(tags))
+    for registry, names in tags:
+        out += encode_string(registry) + encode_varint(len(names))
+        for name in names:
+            out += encode_string(name) + encode_varint(0)  # Empty tag
+    return out
+
+
+# ----- Session ---------------------------------------------------------------
+
+def limbo_supported(config: dict, protocol: int) -> bool:
+    """Whether a connecting client should be put in the limbo instead of being kicked."""
+    if str(config.get("join_method", "kick")).lower() != "limbo":
+        return False
+    return protocol in LIMBO_PLAY_IDS
+
+
+def limbo_transfer_target(config: dict, client_host: str | None, client_port: int | None) -> tuple[str, int] | None:
+    """Address to transfer a player to: the configured one, else the one they joined with."""
+    host = config.get("limbo_transfer_host")
+    if not host:
+        # Forge and proxies append extra data after a NUL; SRV targets end with a dot
+        host = (client_host or "").split("\0", 1)[0].rstrip(".")
+    host = str(host).strip()
+    port = config.get("limbo_transfer_port") or client_port
+
+    if not host or len(host) > 255 or not re.fullmatch(r"[A-Za-z0-9._:\-\[\]]+", host):
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < port < 65536:
+        return None
+    return host, port
+
+
+async def _limbo_expect(reader: asyncio.StreamReader, packet_id: int, timeout: float = 20) -> bytes:
+    """Read packets until one with the given ID arrives, ignoring the others."""
+    async def _read() -> bytes:
+        while True:
+            pid, data = await read_packet(reader)
+            if pid == packet_id:
+                return data
+    return await asyncio.wait_for(_read(), timeout=timeout)
+
+
+async def _limbo_discard(reader: asyncio.StreamReader):
+    """Read and drop everything the client sends, until it disconnects."""
+    try:
+        while True:
+            await read_packet(reader)
+    except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
+        pass
+
+
+async def run_limbo(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    protocol: int,
+    player_name: str,
+    player_uuid: uuidlib.UUID,
+    target: tuple[str, int],
+    config: dict,
+    server_mgr: "ServerManager",
+):
+    """Hold a player in the fake server until the real one is ready, then transfer them."""
+    ids = LIMBO_PLAY_IDS[protocol]
+
+    def send(packet_id: int, payload: bytes = b""):
+        writer.write(make_packet(packet_id, payload))
+
+    # --- Login ---
+    send(0x02, build_login_success(protocol, player_uuid, player_name))
+    await writer.drain()
+
+    # --- Configuration ---
+    known_packs_id, tags_id = (0x0F, 0x0E) if protocol >= PROTO_26_3 else (0x0E, 0x0D)
+    await _limbo_expect(reader, 0x03)  # Login Acknowledged
+    send(known_packs_id, build_known_packs(protocol))
+    await writer.drain()
+    reply = await _limbo_expect(reader, 0x07)  # Client's known packs
+    if decode_varint(reply)[0] < 1:
+        log.warning(f"{player_name}'s client does not have the vanilla data pack for protocol {protocol}; cannot enter limbo.")
+        send(0x02, encode_text(apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)))
+        await writer.drain()
+        return
+    for registry, entries in limbo_registries(protocol):
+        send(0x07, build_registry_data(registry, entries))
+    tags = limbo_tags(protocol)
+    if tags:
+        send(tags_id, build_update_tags(tags))
+    send(0x03)  # Finish Configuration
+    await writer.drain()
+    await _limbo_expect(reader, 0x03)  # Acknowledge Finish Configuration
+
+    # --- Play ---
+    send(ids["join"], build_join_game(protocol))
+    send(ids["abilities"], enc_i8(0x07) + enc_f32(0.0) + enc_f32(0.1))  # Invulnerable, flying
+    send(ids["pos"], build_position(protocol))
+    send(ids["spawn"], build_spawn_position(protocol))
+    send(ids["event"], enc_u8(13) + enc_f32(0.0))  # Start waiting for chunks (closes the loading screen)
+    await writer.drain()
+    log.info(f"{player_name} is waiting in the limbo (protocol {protocol})")
+
+    discard_task = asyncio.create_task(_limbo_discard(reader))
+    try:
+        tick = 0
+        while not server_mgr._ready_event.is_set():
+            if discard_task.done():
+                log.info(f"{player_name} left the limbo")
+                return
+            if not server_mgr._starting:
+                # Startup was abandoned (e.g. startup_timeout reached)
+                log.info(f"Removing {player_name} from the limbo: the server failed to start")
+                send(ids["disconnect"], encode_text(config["limbo_failed_kick_message"]))
+                await writer.drain()
+                return
+
+            def text(key: str) -> str:
+                return apply_placeholders(str(config.get(key) or ""), config["server_dir"], server_mgr._start_time)
+
+            writer.write(build_title_packets(ids, text("limbo_title"), text("limbo_subtitle"), text("limbo_actionbar")))
+            if tick % 5 == 0:
+                send(ids["keepalive"], enc_i64(tick))
+            await writer.drain()
+            tick += 1
+
+            try:
+                await asyncio.wait_for(server_mgr._ready_event.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+
+        # --- Hand over ---
+        if discard_task.done():
+            return
+        log.info(f"Transferring {player_name} from the limbo to {target[0]}:{target[1]}")
+        send(ids["transfer"], encode_string(target[0]) + encode_varint(target[1]))
+        await writer.drain()
+
+        # Give the client a moment to act on it before the connection is closed
+        try:
+            await asyncio.wait_for(asyncio.shield(discard_task), timeout=3)
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        discard_task.cancel()
 
 
 async def handle_connection(
@@ -1363,14 +2140,20 @@ async def handle_connection(
         _server_address, offset = decode_string(handshake_data, offset)
         _server_port = struct.unpack(">H", handshake_data[offset : offset + 2])[0]
         offset += 2
+        intent_offset = offset
         next_state, offset = decode_varint(handshake_data, offset)
+
+        # Intent 3 is a client arriving through a Transfer packet (1.20.5+), e.g. from the limbo.
+        # Servers reject it unless accepts-transfers is enabled, so it is passed on as a normal login.
+        if next_state == 3:
+            handshake_data = handshake_data[:intent_offset] + encode_varint(2)
 
         handshake_packet = make_packet(0x00, handshake_data)
 
         if next_state == 1:
             await handle_status(reader, writer, handshake_packet, config, server_mgr)
-        elif next_state == 2:
-            await handle_login(reader, writer, handshake_packet, protocol_version, config, server_mgr, addr, smdata, citydata)
+        elif next_state in (2, 3):
+            await handle_login(reader, writer, handshake_packet, protocol_version, config, server_mgr, addr, smdata, citydata, _server_address, _server_port)
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError) as e:
         log.debug(f"Connection {addr} closed: {e}")
     except Exception as e:
@@ -1453,7 +2236,7 @@ def save_verified_ips(ips: list[str]):
 
 verified_ips = load_verified_ips()
 
-async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, handshake_packet, protocol_version, config, server_mgr: ServerManager, addr, smdata, citydata):
+async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, handshake_packet, protocol_version, config, server_mgr: ServerManager, addr, smdata, citydata, client_host: str | None = None, client_port: int | None = None):
     global backup_time
 
     packet_id, login_data = await asyncio.wait_for(read_packet(reader), timeout=10)
@@ -1557,6 +2340,15 @@ async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 config["server_dir"], server_mgr._start_time,
             )
         else:
+            # Limbo join method: wait in a fake server instead of being kicked
+            if status in ("started", "starting") and limbo_supported(config, protocol_version):
+                target = limbo_transfer_target(config, client_host, client_port)
+                player_uuid = parse_login_start_uuid(login_data)
+                if target is None:
+                    log.warning(f"Cannot work out an address to transfer {player_name} to ({client_host!r}); set limbo_transfer_host. Kicking instead.")
+                elif player_uuid is not None:
+                    return await run_limbo(reader, writer, protocol_version, player_name, player_uuid, target, config, server_mgr)
+
             kick_msg = apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)
     await send_disconnect_login(writer, kick_msg)
 
