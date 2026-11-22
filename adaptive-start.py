@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-VERSION = '3.3'
+VERSION = '3.4'
 
 """
 Minecraft Adaptive Server Starter (MASS)!
@@ -66,6 +66,7 @@ import base64
 import datetime
 import fcntl
 import fnmatch
+import gzip
 import os
 import json
 import logging
@@ -80,6 +81,9 @@ import random
 import threading
 import socket
 import uuid as uuidlib
+import zlib
+from array import array
+from collections import Counter
 
 log = logging.getLogger("ServerStarter")
 
@@ -185,6 +189,12 @@ limbo_title: "§eThis server is waking up..."
 limbo_subtitle: "§bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}"
 limbo_actionbar: "§7You will join automatically once it is ready"
 
+# Boss bar that fills up as the server starts, based on the average startup time.
+# Same placeholders as above. Set limbo_bossbar to null to hide it.
+# Colors: pink, blue, red, green, yellow, purple, white.
+limbo_bossbar: "§eEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}"
+limbo_bossbar_color: yellow
+
 # Message when the server did not manage to start while players were waiting.
 limbo_failed_kick_message: "§4The server failed to start.§r\\n\\nPlease try again later."
 
@@ -193,6 +203,25 @@ limbo_failed_kick_message: "§4The server failed to start.§r\\n\\nPlease try ag
 # Set them if players join through an SRV record or a raw IP and the transfer does not bring them back.
 limbo_transfer_host: null
 limbo_transfer_port: null
+
+# A small world for players to explore while they wait (e.g. a parkour course).
+# Path to a Sponge schematic (.schem) file, relative to server_dir. Set to null for an empty void.
+# Create one with WorldEdit or FAWE: select the build, //copy, then //schem save <name>.
+# The schematic's lowest corner is placed at 0, 0, 0. Players who fall off are returned to the spawn.
+# Requires the limbo-data.json.gz file next to this script (downloaded automatically if missing).
+# Not imported: sign text, container contents and entities. Doors and buttons do not work.
+limbo_world: null
+
+# Where players appear in the limbo world: [x, y, z] or [x, y, z, yaw, pitch].
+# Set to null to spawn on top of the middle of the schematic.
+limbo_spawn: null
+
+# Game mode in the limbo: survival, creative, adventure or spectator.
+# Adventure is recommended with a limbo_world. Without one, players cannot move in any game mode.
+limbo_gamemode: spectator
+
+# Time of day in the limbo: day, noon, night, midnight, or a number of ticks (0 - 24000).
+limbo_time: day
 
 # -------------------------------------------------------------------------
 # Auto-stop & Timing
@@ -1608,8 +1637,9 @@ class ServerManager:
 # Limbo (fake waiting server)
 #
 # Used when join_method is "limbo". MASS completes an offline-style login itself,
-# puts the player in an empty world, shows the time remaining in the title and
-# action bar, and transfers the player to the real server once it is ready.
+# puts the player in an empty world (or the limbo_world schematic), shows the time
+# remaining in the title and action bar, and transfers the player to the real
+# server once it is ready.
 # Only Minecraft 1.20.5+ is supported, since older clients have no Transfer packet;
 # every other version gets the classic kick.
 # =============================================================================
@@ -1630,22 +1660,37 @@ LIMBO_PLAY_IDS: dict[int, dict[str, int]] = {}
 
 
 def _limbo_ids(protocols, join, pos, keepalive, abilities, spawn, event, disconnect,
-               title, subtitle, actionbar, times, transfer):
+               title, subtitle, actionbar, times, transfer, chunk, center, time_):
     for p in protocols:
         LIMBO_PLAY_IDS[p] = {
             "join": join, "pos": pos, "keepalive": keepalive, "abilities": abilities,
             "spawn": spawn, "event": event, "disconnect": disconnect, "title": title,
             "subtitle": subtitle, "actionbar": actionbar, "times": times, "transfer": transfer,
+            "chunk": chunk, "center": center, "time": time_,
         }
 
 
-#           protocols                      join  pos   keep  abil  spawn event disc  title sub   abar  times transfer
-_limbo_ids((766, 767),                     0x2B, 0x40, 0x26, 0x38, 0x56, 0x22, 0x1D, 0x65, 0x63, 0x4C, 0x66, 0x73)  # 1.20.5 - 1.21.1
-_limbo_ids((768, 769),                     0x2C, 0x42, 0x27, 0x3A, 0x5B, 0x23, 0x1D, 0x6C, 0x6A, 0x51, 0x6D, 0x7A)  # 1.21.2 - 1.21.4
-_limbo_ids((770, 771, 772),                0x2B, 0x41, 0x26, 0x39, 0x5A, 0x22, 0x1C, 0x6B, 0x69, 0x50, 0x6C, 0x7A)  # 1.21.5 - 1.21.8
-_limbo_ids((773, 774),                     0x30, 0x46, 0x2B, 0x3E, 0x5F, 0x26, 0x20, 0x70, 0x6E, 0x55, 0x71, 0x7F)  # 1.21.9 - 1.21.11
-_limbo_ids((775, 776),                     0x31, 0x48, 0x2C, 0x40, 0x61, 0x26, 0x20, 0x72, 0x70, 0x57, 0x73, 0x81)  # 26.1.x, 26.2
-_limbo_ids((777,),                         0x32, 0x49, 0x2D, 0x41, 0x63, 0x27, 0x20, 0x74, 0x72, 0x59, 0x75, 0x84)  # 26.3
+#           protocols        join  pos   keep  abil  spawn event disc  title sub   abar  times trans chunk centr time
+_limbo_ids((766, 767),       0x2B, 0x40, 0x26, 0x38, 0x56, 0x22, 0x1D, 0x65, 0x63, 0x4C, 0x66, 0x73, 0x27, 0x54, 0x64)  # 1.20.5 - 1.21.1
+_limbo_ids((768, 769),       0x2C, 0x42, 0x27, 0x3A, 0x5B, 0x23, 0x1D, 0x6C, 0x6A, 0x51, 0x6D, 0x7A, 0x28, 0x58, 0x6B)  # 1.21.2 - 1.21.4
+_limbo_ids((770, 771, 772),  0x2B, 0x41, 0x26, 0x39, 0x5A, 0x22, 0x1C, 0x6B, 0x69, 0x50, 0x6C, 0x7A, 0x27, 0x57, 0x6A)  # 1.21.5 - 1.21.8
+_limbo_ids((773, 774),       0x30, 0x46, 0x2B, 0x3E, 0x5F, 0x26, 0x20, 0x70, 0x6E, 0x55, 0x71, 0x7F, 0x2C, 0x5C, 0x6F)  # 1.21.9 - 1.21.11
+_limbo_ids((775, 776),       0x31, 0x48, 0x2C, 0x40, 0x61, 0x26, 0x20, 0x72, 0x70, 0x57, 0x73, 0x81, 0x2D, 0x5E, 0x71)  # 26.1.x, 26.2
+_limbo_ids((777,),           0x32, 0x49, 0x2D, 0x41, 0x63, 0x27, 0x20, 0x74, 0x72, 0x59, 0x75, 0x84, 0x2E, 0x60, 0x73)  # 26.3
+
+# Serverbound Play packet IDs that start with the player's position (Set Player Position,
+# and Set Player Position and Rotation). Used to notice players falling out of the limbo world.
+for _p, _ids in LIMBO_PLAY_IDS.items():
+    _ids["boss"] = 0x0A if _p < 770 else 0x09  # Boss Bar
+
+# Serverbound position packets (see below)
+LIMBO_MOVE_IDS: dict[int, tuple[int, ...]] = {
+    766: (0x1A, 0x1B), 767: (0x1A, 0x1B),
+    768: (0x1C, 0x1D), 769: (0x1C, 0x1D), 770: (0x1C, 0x1D),
+    771: (0x1D, 0x1E), 772: (0x1D, 0x1E), 773: (0x1D, 0x1E),
+    774: (0x1D, 0x1E, 0x1F),  # Not confirmed for 1.21.11; the packet length tells them apart
+    775: (0x1E, 0x1F), 776: (0x1E, 0x1F), 777: (0x1E, 0x1F),
+}
 
 # Game versions sharing each protocol number. The client only uses its built-in
 # registry data if the "minecraft:core" pack version matches its own version
@@ -1666,8 +1711,20 @@ LIMBO_CORE_PACKS: dict[int, tuple[str, ...]] = {
 }
 
 LIMBO_WORLD = "minecraft:overworld"
-LIMBO_GAMEMODE = 3      # Spectator: no HUD clutter and no falling
-LIMBO_SPAWN_Y = 400     # Above the build limit, so no chunks need to be sent
+LIMBO_SPAWN_Y = 400     # Without a limbo_world: above the build limit, so no chunks need to be sent
+LIMBO_MIN_Y = -64       # Overworld height limits
+LIMBO_HEIGHT = 384
+LIMBO_VOID_Y = -100     # Players in a limbo_world who fall below this are returned to the spawn
+LIMBO_MAX_SIZE = 512    # Largest schematic width and length, in blocks
+LIMBO_DRAIN_TIMEOUT = 30  # Seconds a client may take to receive what was sent before it is dropped
+LIMBO_COMPRESSION = 256  # Packet compression threshold, only used when a limbo_world is sent
+
+LIMBO_GAMEMODES = {"survival": 0, "creative": 1, "adventure": 2, "spectator": 3}
+LIMBO_TIMES = {"day": 1000, "noon": 6000, "night": 13000, "midnight": 18000}
+
+# Block state IDs for every supported version, generated by tools/gen-limbo-data.py
+LIMBO_DATA_FILE = "limbo-data.json.gz"
+LIMBO_DATA_FORMAT = 1
 
 _DAMAGE_TYPES_1_20_5 = (
     "arrow", "bad_respawn_point", "cactus", "cramming", "dragon_breath", "drown", "dry_out",
@@ -1756,6 +1813,551 @@ def _nbt_string(text: str) -> bytes:
 def encode_text(text: str) -> bytes:
     """Text component for Play/Configuration packets: a nameless NBT string tag."""
     return b"\x08" + _nbt_string(text)
+
+
+# ----- Limbo world -----------------------------------------------------------
+#
+# An optional small world (limbo_world) read from a Sponge schematic file. The
+# schematic names its blocks; the numeric IDs chunk packets need come from
+# limbo-data.json.gz, which holds a table for each supported protocol version.
+
+_NBT_NUMBERS = {1: ">b", 2: ">h", 3: ">i", 4: ">q", 5: ">f", 6: ">d"}
+_LIMBO_AIR = ("minecraft:air", "minecraft:cave_air", "minecraft:void_air")
+
+
+def read_nbt(data: bytes) -> dict:
+    """Parse an uncompressed NBT file into plain Python values. Returns the root compound."""
+    pos = 0
+
+    def take(count: int) -> bytes:
+        nonlocal pos
+        if count < 0 or pos + count > len(data):
+            raise ValueError("NBT data is truncated")
+        chunk = data[pos : pos + count]
+        pos += count
+        return chunk
+
+    def number(fmt: str):
+        return struct.unpack(fmt, take(struct.calcsize(fmt)))[0]
+
+    def string() -> str:
+        return take(number(">H")).decode("utf-8", "replace")
+
+    def payload(tag: int, depth: int):
+        if depth > 64:
+            raise ValueError("NBT data is nested too deeply")
+        if tag in _NBT_NUMBERS:
+            return number(_NBT_NUMBERS[tag])
+        if tag == 7:  # Byte array
+            return take(number(">i"))
+        if tag == 8:
+            return string()
+        if tag == 9:  # List
+            item_tag = number(">B")
+            return [payload(item_tag, depth + 1) for _ in range(number(">i"))]
+        if tag == 10:  # Compound
+            out = {}
+            while True:
+                child = number(">B")
+                if child == 0:
+                    return out
+                name = string()
+                out[name] = payload(child, depth + 1)
+        if tag in (11, 12):  # Int array, long array
+            count = number(">i")
+            size = 4 if tag == 11 else 8
+            return list(struct.unpack(f">{count}{'i' if tag == 11 else 'q'}", take(count * size)))
+        raise ValueError(f"Unknown NBT tag {tag}")
+
+    if number(">B") != 10:
+        raise ValueError("Not an NBT file")
+    string()  # Root name
+    return payload(10, 0)
+
+
+def _pack_entries(values, bits: int) -> bytes:
+    """Pack 4096 palette entries into the 64-bit longs of a paletted container.
+
+    Entries fill each long from its lowest bits and never span two longs.
+    """
+    if bits == 4:
+        values = bytes(values)
+        low = int.from_bytes(values[0::2], "little")
+        high = int.from_bytes(values[1::2], "little")
+        values = (low | (high << 4)).to_bytes(2048, "little")
+        bits = 8
+    if bits == 8:
+        values = bytes(values)
+        return b"".join([values[i : i + 8][::-1] for i in range(0, len(values), 8)])
+    per_long = 64 // bits
+    longs = []
+    for i in range(0, 4096, per_long):
+        value = 0
+        shift = 0
+        for entry in values[i : i + per_long]:
+            value |= entry << shift
+            shift += bits
+        longs.append(value)
+    return struct.pack(f">{len(longs)}Q", *longs)
+
+
+class LimboWorld:
+    """A schematic split into 16x16x16 sections, independent of the protocol version."""
+
+    def __init__(self, path: Path):
+        raw = path.read_bytes()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        root = read_nbt(raw)
+        root = root.get("Schematic", root)  # Version 3 nests everything in "Schematic"
+        if not isinstance(root, dict):
+            raise ValueError("not a Sponge schematic")
+
+        blocks = root.get("Blocks")
+        if isinstance(blocks, dict):  # Version 3
+            palette_map, data = blocks.get("Palette"), blocks.get("Data")
+        else:  # Version 2
+            palette_map, data = root.get("Palette"), root.get("BlockData")
+        try:
+            width, height, length = (int(root[k]) & 0xFFFF for k in ("Width", "Height", "Length"))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("not a Sponge schematic (no size)") from None
+        if not isinstance(palette_map, dict) or not isinstance(data, (bytes, bytearray)) or not palette_map:
+            raise ValueError("not a Sponge schematic version 2 or 3 (no block palette)")
+        if not width or not height or not length:
+            raise ValueError("the schematic is empty")
+        if width > LIMBO_MAX_SIZE or length > LIMBO_MAX_SIZE:
+            raise ValueError(f"the schematic is {width}x{length} blocks; the limit is {LIMBO_MAX_SIZE}x{LIMBO_MAX_SIZE}")
+
+        # Palette: block state name for each index, plus air for the space around the build
+        size = max(palette_map.values()) + 1
+        if min(palette_map.values()) < 0 or size > 60000:
+            raise ValueError("the schematic's block palette is invalid")
+        palette = ["minecraft:air"] * size
+        for name, index in palette_map.items():
+            palette[index] = str(name)
+        if "minecraft:air" not in palette:
+            palette.append("minecraft:air")
+        self.palette = palette
+        air = palette.index("minecraft:air")
+        is_air = [name.split("[", 1)[0] in _LIMBO_AIR for name in palette]
+
+        # Block data: one VarInt palette index per block, ordered x, then z, then y
+        volume = width * height * length
+        if max(data) < 0x80:
+            indices = bytes(data)  # Every index fits in one byte
+        else:
+            values = array("H")
+            value = shift = 0
+            for byte in data:
+                value |= (byte & 0x7F) << shift
+                if byte & 0x80:
+                    shift += 7
+                    if shift > 14:
+                        raise ValueError("the schematic's block data is invalid")
+                else:
+                    values.append(value)
+                    value = shift = 0
+            indices = bytes(values) if len(palette) <= 256 and max(values) < 256 else values
+        if len(indices) != volume or max(indices) >= len(palette):
+            raise ValueError("the schematic's block data does not match its size")
+
+        max_height = LIMBO_MIN_Y + LIMBO_HEIGHT
+        if height > max_height:
+            log.warning(f"Limbo world: {path.name} is {height} blocks tall; everything above Y={max_height - 1} is cut off.")
+            height = max_height
+        self.width, self.height, self.length = width, height, length
+        self.chunks_x = (width + 15) // 16
+        self.chunks_z = (length + 15) // 16
+
+        # Default spawn: on top of the column nearest to the middle that has a block in it
+        layer = width * length
+        self.spawn = None
+        mid_x, mid_z = width // 2, length // 2
+        columns = sorted(((x - mid_x) ** 2 + (z - mid_z) ** 2, x, z) for x in range(width) for z in range(length))
+        for _distance, x, z in columns:
+            column = indices[z * width + x : height * layer : layer]
+            for y in range(height - 1, -1, -1):
+                if not is_air[column[y]]:
+                    self.spawn = (x + 0.5, float(y + 1), z + 0.5, 0.0, 0.0)
+                    break
+            if self.spawn:
+                break
+        if self.spawn is None:
+            raise ValueError("the schematic contains no blocks")
+
+        # Sections, keyed by (chunk x, section y, chunk z). Each is the list of palette
+        # indices it uses, how many blocks use each, the bits per entry and the packed
+        # entries (or, with over 256 different blocks, the unpacked entries).
+        self.sections: dict[tuple[int, int, int], tuple] = {}
+        wide = not isinstance(indices, bytes)
+        pad = array("H", [air]) if wide else bytes([air])
+        for sy in range((height + 15) // 16):
+            for cz in range(self.chunks_z):
+                for cx in range(self.chunks_x):
+                    x0, x1 = cx * 16, min(cx * 16 + 16, width)
+                    x_pad = pad * (16 - (x1 - x0))
+                    parts = []
+                    for y in range(sy * 16, sy * 16 + 16):
+                        if y >= height:
+                            parts.append(pad * 256)
+                            continue
+                        for z in range(cz * 16, cz * 16 + 16):
+                            if z >= length:
+                                parts.append(pad * 16)
+                                continue
+                            offset = (y * length + z) * width
+                            parts.append(indices[offset + x0 : offset + x1])
+                            if x_pad:
+                                parts.append(x_pad)
+                    if wide:
+                        section = array("H")
+                        for part in parts:
+                            section.extend(part)
+                    else:
+                        section = b"".join(parts)
+
+                    counts = Counter(section)
+                    used = sorted(counts)
+                    if all(is_air[i] for i in used):
+                        continue
+                    amounts = [counts[i] for i in used]
+                    if len(used) == 1:
+                        self.sections[cx, sy, cz] = (used, amounts, 0, b"")
+                    elif len(used) <= 256:
+                        bits = max(4, (len(used) - 1).bit_length())
+                        if wide:
+                            lookup = {index: n for n, index in enumerate(used)}
+                            local = bytes([lookup[i] for i in section])
+                        else:
+                            table = bytearray(256)
+                            for n, index in enumerate(used):
+                                table[index] = n
+                            local = section.translate(bytes(table))
+                        self.sections[cx, sy, cz] = (used, amounts, bits, _pack_entries(local, bits))
+                    else:
+                        self.sections[cx, sy, cz] = (used, amounts, -1, section)
+
+        self.packets: dict[int, bytes | None] = {}  # Encoded chunk packets per protocol
+
+    def view_distance(self, spawn: tuple) -> int:
+        """Chunks the client has to keep around the spawn chunk to hold the whole world."""
+        cx, cz = int(spawn[0] // 16), int(spawn[2] // 16)
+        distance = max(cx + 1, self.chunks_x - cx, cz + 1, self.chunks_z - cz)
+        return max(2, min(32, distance))
+
+
+def limbo_data_path() -> Path:
+    return Path(os.path.abspath(__file__)).parent / LIMBO_DATA_FILE
+
+
+_limbo_data_cache: dict = {"mtime": None, "data": None}
+
+
+def limbo_block_data() -> dict | None:
+    """The block state tables from limbo-data.json.gz, or None if it cannot be used."""
+    path = limbo_data_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if _limbo_data_cache["mtime"] != mtime:
+        data = None
+        try:
+            data = json.loads(gzip.decompress(path.read_bytes()))
+            if data.get("format") != LIMBO_DATA_FORMAT:
+                log.warning(f"{path.name} is for a different version of MASS and cannot be used.")
+                data = None
+        except (OSError, ValueError, EOFError, AttributeError) as e:
+            log.warning(f"Could not read {path.name}: {e}")
+        _limbo_data_cache.update(mtime=mtime, data=data)
+    return _limbo_data_cache["data"]
+
+
+def limbo_data_complete() -> bool:
+    """Whether limbo-data.json.gz exists and covers every supported protocol version."""
+    data = limbo_block_data()
+    return data is not None and all(str(p) in data.get("protocols", {}) for p in LIMBO_PLAY_IDS)
+
+
+def fetch_limbo_data(config: dict) -> bool:
+    """Download limbo-data.json.gz from next to the script on the update servers."""
+    target = limbo_data_path()
+    for url in config.get("auto_update_urls") or []:
+        data_url = str(url).rsplit("/", 1)[0] + "/" + LIMBO_DATA_FILE
+        try:
+            r = requests.get(data_url, timeout=10)
+            if r.status_code != 200:
+                raise Exception(f"Returned status code {r.status_code}")
+            if json.loads(gzip.decompress(r.content)).get("format") != LIMBO_DATA_FORMAT:
+                raise Exception("It is for a different version of MASS")
+            temp = target.with_name(target.name + ".tmp")
+            temp.write_bytes(r.content)
+            os.replace(temp, target)
+            log.info(f"Downloaded {LIMBO_DATA_FILE}")
+            return True
+        except Exception as e:
+            log.warning(f"Unable to download {data_url}: {e}")
+    return False
+
+
+def resolve_block_states(palette: list[str], blocks: dict, layouts: list) -> tuple[list[int], list[str]]:
+    """Turn block state names into one version's numeric IDs.
+
+    Returns the IDs and the names of blocks that version does not have (sent as air).
+    Properties that are missing or not recognised keep the block's default value.
+    """
+    ids = []
+    unknown = []
+    for state in palette:
+        name, _, props_text = state.partition("[")
+        entry = blocks.get(name.removeprefix("minecraft:")) if name.startswith("minecraft:") or ":" not in name else None
+        if entry is None:
+            ids.append(0)
+            if name not in unknown:
+                unknown.append(name)
+            continue
+        props = dict(p.split("=", 1) for p in props_text.rstrip("]").split(",") if "=" in p)
+
+        if isinstance(entry, dict):  # Block whose states are listed one by one
+            key = ",".join(f"{k}={v}" for k, v in sorted(props.items()))
+            ids.append(entry["states"].get(key, entry["default"]))
+            continue
+
+        base, layout_index, default = entry
+        layout = layouts[layout_index]
+        # A state's offset is its property values read as a mixed-radix number
+        offset = 0
+        remaining = default
+        divisor = 1
+        for _prop, values in layout:
+            divisor *= len(values)
+        for prop, values in layout:
+            divisor //= len(values)
+            choice, remaining = divmod(remaining, divisor)
+            value = props.get(prop)
+            if value in values:
+                choice = values.index(value)
+            offset = offset * len(values) + choice
+        ids.append(base + offset)
+    return ids, unknown
+
+
+def limbo_frame(packet_id: int, payload: bytes = b"", compressed: bool = False) -> bytes:
+    """Frame a packet, using the compressed packet format if compression was enabled."""
+    if not compressed:
+        return make_packet(packet_id, payload)
+    data = encode_varint(packet_id) + payload
+    if len(data) < LIMBO_COMPRESSION:
+        body = b"\x00" + data
+    else:
+        body = encode_varint(len(data)) + zlib.compress(data)
+    return encode_varint(len(body)) + body
+
+
+async def limbo_read_packet(reader: asyncio.StreamReader, compressed: bool = False) -> tuple[int, bytes]:
+    if not compressed:
+        return await read_packet(reader)
+    length = await read_varint(reader)
+    if length <= 0 or length > 2**21:
+        raise ValueError(f"Invalid packet length: {length}")
+    body = await reader.readexactly(length)
+    try:
+        data_length, offset = decode_varint(body)
+        if data_length == 0:
+            data = body[offset:]
+        elif 0 < data_length <= 2**23:
+            data = zlib.decompressobj().decompress(body[offset:], data_length)
+        else:
+            raise ValueError(f"Invalid packet data length: {data_length}")
+        packet_id, offset = decode_varint(data)
+    except (IndexError, zlib.error) as e:
+        raise ValueError(f"Invalid packet: {e}") from None
+    return packet_id, data[offset:]
+
+
+def build_chunk_packets(world: LimboWorld, protocol: int, data: dict) -> bytes:
+    """Every Chunk Data and Update Light packet of the world, framed and compressed."""
+    blocks = data["protocols"][str(protocol)]
+    layouts = data["layouts"]
+    ids, unknown = resolve_block_states(world.palette, blocks, layouts)
+    if unknown:
+        shown = ", ".join(unknown[:5]) + ("..." if len(unknown) > 5 else "")
+        log.warning(f"Limbo world: {len(unknown)} block type(s) do not exist in protocol {protocol} "
+                    f"and are shown as air: {shown}")
+
+    # Bits per entry when a section does not use a palette: enough for every block state
+    states = 0
+    for entry in blocks.values():
+        if isinstance(entry, dict):
+            states = max(states, max(entry["states"].values()) + 1)
+        else:
+            count = 1
+            for _prop, values in layouts[entry[1]]:
+                count *= len(values)
+            states = max(states, entry[0] + count)
+    direct_bits = max(1, (states - 1).bit_length())
+
+    has_length = protocol < PROTO_1_21_5  # Older versions prefix the entries with their length
+    no_entries = encode_varint(0) if has_length else b""
+    counts_fluids = protocol >= PROTO_26_1
+    biomes = b"\x00" + encode_varint(0) + no_entries  # One biome everywhere: index 0 (plains)
+
+    def section_header(block_count: int) -> bytes:
+        return struct.pack(">h", block_count) + (b"\x00\x00" if counts_fluids else b"")
+
+    def entries(packed: bytes) -> bytes:
+        return (encode_varint(len(packed) // 8) if has_length else b"") + packed
+
+    empty_section = section_header(0) + b"\x00" + encode_varint(0) + no_entries + biomes
+
+    if protocol >= PROTO_1_21_5:
+        heightmaps = encode_varint(1) + encode_varint(4) + encode_varint(37) + bytes(37 * 8)  # 4: MOTION_BLOCKING
+    else:
+        heightmaps = b"\x0a\x0c" + _nbt_string("MOTION_BLOCKING") + enc_i32(37) + bytes(37 * 8) + b"\x00"
+
+    # Light: full sky light in every section (plus one below and one above the world), no block light
+    light_sections = LIMBO_HEIGHT // 16 + 2
+    bits = (1 << light_sections) - 1
+    if protocol >= PROTO_26_3:  # Bit sets are sent as bytes (lowest bits first) instead of longs
+        raw = bits.to_bytes((light_sections + 7) // 8, "little")
+        mask = encode_varint(len(raw)) + raw
+    else:
+        mask = encode_varint(1) + enc_i64(bits)
+    light = (mask + encode_varint(0) + encode_varint(0) + mask
+             + encode_varint(light_sections) + (encode_varint(2048) + b"\xff" * 2048) * light_sections
+             + encode_varint(0))
+
+    below = -LIMBO_MIN_Y // 16  # Sections below Y=0, where the schematic starts
+    total = LIMBO_HEIGHT // 16
+    out = []
+    for cz in range(-1, world.chunks_z + 1):
+        for cx in range(-1, world.chunks_x + 1):  # Includes a border of empty chunks
+            column = []
+            for index in range(total):
+                section = world.sections.get((cx, index - below, cz))
+                if section is None:
+                    column.append(empty_section)
+                    continue
+                used, amounts, bits, packed = section
+                state_ids = [ids[i] for i in used]
+                block_count = sum(n for n, state in zip(amounts, state_ids) if state != 0)
+                if bits == 0:
+                    states_data = b"\x00" + encode_varint(state_ids[0]) + no_entries
+                elif bits > 0:
+                    states_data = (enc_u8(bits) + encode_varint(len(state_ids))
+                                   + b"".join(encode_varint(s) for s in state_ids) + entries(packed))
+                else:
+                    states_data = enc_u8(direct_bits) + entries(_pack_entries([ids[i] for i in packed], direct_bits))
+                column.append(section_header(block_count) + states_data + biomes)
+            sections = b"".join(column)
+            payload = (enc_i32(cx) + enc_i32(cz) + heightmaps + encode_varint(len(sections)) + sections
+                       + encode_varint(0) + light)  # No block entities
+            out.append(limbo_frame(LIMBO_PLAY_IDS[protocol]["chunk"], payload, True))
+    return b"".join(out)
+
+
+_limbo_world_cache: dict = {"key": None, "world": None, "lock": None}
+_limbo_warned: set[str] = set()
+
+
+def _limbo_warn_once(message: str):
+    if message not in _limbo_warned:
+        _limbo_warned.add(message)
+        log.warning(message)
+
+
+async def limbo_world_get(config: dict, protocol: int | None = None) -> tuple["LimboWorld", bytes] | None:
+    """The limbo world and its chunk packets for a protocol version.
+
+    Returns None if no limbo_world is set or it cannot be used, in which case the
+    player gets the empty limbo. The schematic is read again when the file changes.
+    Called without a protocol, it only loads the schematic.
+    """
+    name = config.get("limbo_world")
+    if not name:
+        return None
+    path = Path(config["server_dir"]) / str(name)
+    try:
+        stat = path.stat()
+    except OSError:
+        _limbo_warn_once(f"limbo_world file not found: {path}")
+        return None
+    key = (str(path), stat.st_mtime, stat.st_size)
+
+    cache = _limbo_world_cache
+    if cache["lock"] is None:
+        cache["lock"] = asyncio.Lock()
+    async with cache["lock"]:
+        if cache["key"] != key:
+            world = None
+            try:
+                world = await asyncio.to_thread(LimboWorld, path)
+                log.info(f"Loaded limbo world {path.name}: {world.width}x{world.height}x{world.length} blocks")
+            except Exception as e:
+                log.warning(f"Could not load limbo_world {path}: {e}")
+            cache.update(key=key, world=world)
+        world = cache["world"]
+        if world is None:
+            return None
+        if protocol is None:
+            return world, b""
+
+        if protocol not in world.packets:
+            packets = None
+            data = limbo_block_data()
+            if data is None:
+                _limbo_warn_once(f"limbo_world needs {LIMBO_DATA_FILE} next to this script. "
+                                 "Download it from where you got this script. Using the empty limbo until then.")
+                return None
+            if str(protocol) not in data.get("protocols", {}):
+                _limbo_warn_once(f"{LIMBO_DATA_FILE} has no block data for protocol {protocol}; "
+                                 "those players get the empty limbo.")
+            else:
+                try:
+                    packets = await asyncio.to_thread(build_chunk_packets, world, protocol, data)
+                except Exception as e:
+                    log.warning(f"Could not build the limbo world for protocol {protocol}: {e}")
+            world.packets[protocol] = packets
+        packets = world.packets[protocol]
+        return (world, packets) if packets is not None else None
+
+
+def limbo_gamemode(config: dict) -> int:
+    value = config.get("limbo_gamemode")
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 3:
+        return value
+    mode = LIMBO_GAMEMODES.get(str(value).strip().lower())
+    if mode is None:
+        _limbo_warn_once(f"limbo_gamemode {value!r} is not survival, creative, adventure or spectator; using spectator.")
+        return 3
+    return mode
+
+
+def limbo_time(config: dict) -> int:
+    value = config.get("limbo_time")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 24000:
+        return int(value)
+    ticks = LIMBO_TIMES.get(str(value).strip().lower())
+    if ticks is None:
+        _limbo_warn_once(f"limbo_time {value!r} is not day, noon, night, midnight or 0 - 24000; using day.")
+        return LIMBO_TIMES["day"]
+    return ticks
+
+
+def limbo_spawn_point(config: dict, world: "LimboWorld | None") -> tuple[float, float, float, float, float]:
+    """Where the player appears: x, y, z, yaw, pitch."""
+    if world is None:
+        return 0.5, float(LIMBO_SPAWN_Y), 0.5, 0.0, 0.0
+    value = config.get("limbo_spawn")
+    if value is None:
+        return world.spawn
+    if (isinstance(value, (list, tuple)) and len(value) in (3, 5)
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
+        x, y, z, yaw, pitch = (list(map(float, value)) + [0.0, 0.0])[:5]
+        return x, y, z, yaw, pitch
+    _limbo_warn_once(f"limbo_spawn {value!r} is not [x, y, z] or [x, y, z, yaw, pitch]; using the middle of the world.")
+    return world.spawn
 
 
 # ----- Registries ------------------------------------------------------------
@@ -1850,20 +2452,20 @@ def build_login_success(protocol: int, player_uuid: uuidlib.UUID, name: str) -> 
     return out
 
 
-def build_join_game(protocol: int) -> bytes:
-    gm = LIMBO_GAMEMODE
+def build_join_game(protocol: int, gamemode: int, view_distance: int) -> bytes:
     entity_id = enc_i32(1)  # 26.2+ rejects entity ID 0
     world = encode_string(LIMBO_WORLD)
     no, yes = enc_bool(False), enc_bool(True)
 
-    out = (entity_id + no + encode_varint(1) + world + encode_varint(1) + encode_varint(2) + encode_varint(2)
+    out = (entity_id + no + encode_varint(1) + world + encode_varint(1)
+           + encode_varint(view_distance) + encode_varint(view_distance)
            + no + yes + no)  # reducedDebugInfo, enableRespawnScreen, doLimitedCrafting
     out += encode_varint(0)  # Dimension type: index into the registry
     out += world + enc_i64(0)
     if protocol >= PROTO_26_3:
-        out += encode_varint(gm) + encode_varint(0)  # 0 = no previous game mode
+        out += encode_varint(gamemode) + encode_varint(0)  # 0 = no previous game mode
     else:
-        out += enc_u8(gm) + enc_i8(-1)
+        out += enc_u8(gamemode) + enc_i8(-1)
     out += no + yes + no + encode_varint(0)  # isDebug, isFlat, no death location, portal cooldown
     if protocol >= PROTO_1_21_2:
         out += encode_varint(63)  # Sea level
@@ -1873,28 +2475,82 @@ def build_join_game(protocol: int) -> bytes:
     return out
 
 
-def build_position(protocol: int) -> bytes:
-    x, y, z = 0.5, float(LIMBO_SPAWN_Y), 0.5
+def build_abilities(gamemode: int, frozen: bool) -> bytes:
+    """Player abilities. Always invulnerable; frozen players hover in place."""
+    if frozen:
+        return enc_i8(0x07) + enc_f32(0.0) + enc_f32(0.1)  # Invulnerable, flying, at no speed
+    flags = 0x01
+    if gamemode == 1:
+        flags |= 0x04 | 0x08  # May fly, creative mode
+    elif gamemode == 3:
+        flags |= 0x02 | 0x04  # Flying, may fly
+    return enc_i8(flags) + enc_f32(0.05) + enc_f32(0.1)
+
+
+def build_position(protocol: int, spawn: tuple, teleport_id: int = 1) -> bytes:
+    x, y, z, yaw, pitch = spawn
     if protocol >= PROTO_1_21_2:
-        return (encode_varint(1) + enc_f64(x) + enc_f64(y) + enc_f64(z)
-                + enc_f64(0) + enc_f64(0) + enc_f64(0) + enc_f32(0) + enc_f32(0) + enc_i32(0))
-    return enc_f64(x) + enc_f64(y) + enc_f64(z) + enc_f32(0) + enc_f32(0) + enc_i8(0) + encode_varint(1)
+        return (encode_varint(teleport_id) + enc_f64(x) + enc_f64(y) + enc_f64(z)
+                + enc_f64(0) + enc_f64(0) + enc_f64(0) + enc_f32(yaw) + enc_f32(pitch) + enc_i32(0))
+    return (enc_f64(x) + enc_f64(y) + enc_f64(z) + enc_f32(yaw) + enc_f32(pitch) + enc_i8(0)
+            + encode_varint(teleport_id))
 
 
-def build_spawn_position(protocol: int) -> bytes:
-    pos = enc_position(0, LIMBO_SPAWN_Y, 0)
+def build_spawn_position(protocol: int, spawn: tuple) -> bytes:
+    x, y, z, yaw, pitch = spawn
+    pos = enc_position(int(x // 1), int(y // 1), int(z // 1))
     if protocol >= PROTO_1_21_9:
-        return encode_string(LIMBO_WORLD) + pos + enc_f32(0) + enc_f32(0)
-    return pos + enc_f32(0)
+        return encode_string(LIMBO_WORLD) + pos + enc_f32(yaw) + enc_f32(pitch)
+    return pos + enc_f32(yaw)
 
 
-def build_title_packets(ids: dict, title: str, subtitle: str, actionbar: str) -> bytes:
+def build_time(protocol: int, ticks: int) -> bytes:
+    """Set the time of day, with the clock stopped."""
+    if protocol >= PROTO_26_1:
+        # One clock update: the overworld clock (index 0 of the world_clock registry),
+        # total ticks (VarLong), partial tick, rate (0 = stopped)
+        return (enc_i64(ticks) + encode_varint(1) + encode_varint(0)
+                + encode_varint(ticks) + enc_f32(0.0) + enc_f32(0.0))
+    if protocol >= PROTO_1_21_2:
+        return enc_i64(ticks) + enc_i64(ticks) + enc_bool(False)  # False: time does not advance
+    return enc_i64(ticks) + enc_i64(-(ticks % 24000 or 24000))  # Negative: time does not advance
+
+
+LIMBO_BOSSBAR_COLORS = ("pink", "blue", "red", "green", "yellow", "purple", "white")
+
+
+def build_bossbar_add(bar_id: uuidlib.UUID, title: str, progress: float, color: str) -> bytes:
+    """Boss Bar packet, action 0 (add): title, progress, color, style 0 (solid), no flags."""
+    color_id = LIMBO_BOSSBAR_COLORS.index(color) if color in LIMBO_BOSSBAR_COLORS else 4
+    return (bar_id.bytes + encode_varint(0) + encode_text(title) + enc_f32(progress)
+            + encode_varint(color_id) + encode_varint(0) + enc_u8(0))
+
+
+def build_bossbar_title(bar_id: uuidlib.UUID, title: str) -> bytes:
+    """Boss Bar packet, action 3 (update title)."""
+    return bar_id.bytes + encode_varint(3) + encode_text(title)
+
+
+def build_bossbar_progress(bar_id: uuidlib.UUID, progress: float) -> bytes:
+    """Boss Bar packet, action 2 (update progress)."""
+    return bar_id.bytes + encode_varint(2) + enc_f32(progress)
+
+
+def limbo_startup_progress(server_dir: str, start_time: float | None) -> float:
+    """How far through the expected startup time the server is, from 0 to 1."""
+    avg = get_avg_startup(server_dir)
+    if not avg or start_time is None:
+        return 0.0
+    return min(1.0, (time.monotonic() - start_time) / avg)
+
+
+def build_title_packets(ids: dict, title: str, subtitle: str, actionbar: str, frame=make_packet) -> bytes:
     """Title timing, subtitle, title and action bar packets."""
     times = enc_i32(0) + enc_i32(60) + enc_i32(20)  # Fade in, stay, fade out (ticks)
-    return (make_packet(ids["times"], times)
-            + make_packet(ids["subtitle"], encode_text(subtitle))
-            + make_packet(ids["title"], encode_text(title))
-            + make_packet(ids["actionbar"], encode_text(actionbar)))
+    return (frame(ids["times"], times)
+            + frame(ids["subtitle"], encode_text(subtitle))
+            + frame(ids["title"], encode_text(title))
+            + frame(ids["actionbar"], encode_text(actionbar)))
 
 
 def build_known_packs(protocol: int) -> bytes:
@@ -1950,21 +2606,36 @@ def limbo_transfer_target(config: dict, client_host: str | None, client_port: in
     return host, port
 
 
-async def _limbo_expect(reader: asyncio.StreamReader, packet_id: int, timeout: float = 20) -> bytes:
+async def _limbo_expect(reader: asyncio.StreamReader, packet_id: int, compressed: bool = False,
+                        timeout: float = 20) -> bytes:
     """Read packets until one with the given ID arrives, ignoring the others."""
     async def _read() -> bytes:
         while True:
-            pid, data = await read_packet(reader)
+            pid, data = await limbo_read_packet(reader, compressed)
             if pid == packet_id:
                 return data
     return await asyncio.wait_for(_read(), timeout=timeout)
 
 
-async def _limbo_discard(reader: asyncio.StreamReader):
-    """Read and drop everything the client sends, until it disconnects."""
+async def _limbo_watch(reader: asyncio.StreamReader, compressed: bool = False,
+                       move_ids: tuple[int, ...] = (), fell: asyncio.Event | None = None):
+    """Read and drop everything the client sends, until it disconnects.
+
+    Sets `fell` when the player's position drops below LIMBO_VOID_Y.
+    """
+    below = False
     try:
         while True:
-            await read_packet(reader)
+            pid, data = await limbo_read_packet(reader, compressed)
+            # Position packets start with x, y, z; the two kinds are 25 and 33 bytes long
+            if pid in move_ids and len(data) in (25, 33):
+                y = struct.unpack_from(">d", data, 8)[0]
+                if y < LIMBO_VOID_Y:
+                    if not below:
+                        fell.set()
+                    below = True
+                else:
+                    below = False
     except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
         pass
 
@@ -1982,23 +2653,44 @@ async def run_limbo(
     """Hold a player in the fake server until the real one is ready, then transfer them."""
     ids = LIMBO_PLAY_IDS[protocol]
 
+    loaded = await limbo_world_get(config, protocol)
+    world, chunk_packets = loaded if loaded else (None, b"")
+    # Chunks are large, so packets are compressed when a world is sent
+    compressed = world is not None
+    gamemode = limbo_gamemode(config)
+    spawn = limbo_spawn_point(config, world)
+
+    def frame(packet_id: int, payload: bytes = b"") -> bytes:
+        return limbo_frame(packet_id, payload, compressed)
+
     def send(packet_id: int, payload: bytes = b""):
-        writer.write(make_packet(packet_id, payload))
+        writer.write(frame(packet_id, payload))
+
+    async def drain():
+        """Wait for the client to receive what was sent; drop clients that stop reading."""
+        try:
+            await asyncio.wait_for(writer.drain(), timeout=LIMBO_DRAIN_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.info(f"Disconnecting {player_name} from the limbo: not receiving data")
+            writer.transport.abort()  # close() would wait for the unsent data to go out
+            raise ConnectionError("client stopped reading") from None
 
     # --- Login ---
+    if compressed:
+        writer.write(make_packet(0x03, encode_varint(LIMBO_COMPRESSION)))  # Set Compression
     send(0x02, build_login_success(protocol, player_uuid, player_name))
-    await writer.drain()
+    await drain()
 
     # --- Configuration ---
     known_packs_id, tags_id = (0x0F, 0x0E) if protocol >= PROTO_26_3 else (0x0E, 0x0D)
-    await _limbo_expect(reader, 0x03)  # Login Acknowledged
+    await _limbo_expect(reader, 0x03, compressed)  # Login Acknowledged
     send(known_packs_id, build_known_packs(protocol))
-    await writer.drain()
-    reply = await _limbo_expect(reader, 0x07)  # Client's known packs
+    await drain()
+    reply = await _limbo_expect(reader, 0x07, compressed)  # Client's known packs
     if decode_varint(reply)[0] < 1:
         log.warning(f"{player_name}'s client does not have the vanilla data pack for protocol {protocol}; cannot enter limbo.")
         send(0x02, encode_text(apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)))
-        await writer.drain()
+        await drain()
         return
     for registry, entries in limbo_registries(protocol):
         send(0x07, build_registry_data(registry, entries))
@@ -2006,60 +2698,112 @@ async def run_limbo(
     if tags:
         send(tags_id, build_update_tags(tags))
     send(0x03)  # Finish Configuration
-    await writer.drain()
-    await _limbo_expect(reader, 0x03)  # Acknowledge Finish Configuration
+    await drain()
+    await _limbo_expect(reader, 0x03, compressed)  # Acknowledge Finish Configuration
 
     # --- Play ---
-    send(ids["join"], build_join_game(protocol))
-    send(ids["abilities"], enc_i8(0x07) + enc_f32(0.0) + enc_f32(0.1))  # Invulnerable, flying
-    send(ids["pos"], build_position(protocol))
-    send(ids["spawn"], build_spawn_position(protocol))
+    view_distance = world.view_distance(spawn) if world else 2
+    send(ids["join"], build_join_game(protocol, gamemode, view_distance))
+    send(ids["abilities"], build_abilities(gamemode, frozen=world is None))
+    send(ids["pos"], build_position(protocol, spawn))
+    send(ids["spawn"], build_spawn_position(protocol, spawn))
+    send(ids["time"], build_time(protocol, limbo_time(config)))
     send(ids["event"], enc_u8(13) + enc_f32(0.0))  # Start waiting for chunks (closes the loading screen)
-    await writer.drain()
+    if world:
+        send(ids["center"], encode_varint(int(spawn[0] // 16)) + encode_varint(int(spawn[2] // 16)))
+        writer.write(chunk_packets)
+    await drain()
     log.info(f"{player_name} is waiting in the limbo (protocol {protocol})")
 
-    discard_task = asyncio.create_task(_limbo_discard(reader))
+    loop = asyncio.get_running_loop()
+    fell = asyncio.Event()
+    watch_task = asyncio.create_task(
+        _limbo_watch(reader, compressed, LIMBO_MOVE_IDS.get(protocol, ()) if world else (), fell))
+    ready_task = asyncio.create_task(server_mgr._ready_event.wait())
+    fell_task = None
     try:
         tick = 0
+        teleports = 1
+        next_tick = loop.time()
+        bossbar_id = uuidlib.uuid4()
+        bossbar_shown = False
+        next_bar = next_tick  # The boss bar's progress is updated every game tick (1/20 s)
+        fell_task = asyncio.create_task(fell.wait())
         while not server_mgr._ready_event.is_set():
-            if discard_task.done():
+            if watch_task.done():
                 log.info(f"{player_name} left the limbo")
                 return
             if not server_mgr._starting:
                 # Startup was abandoned (e.g. startup_timeout reached)
                 log.info(f"Removing {player_name} from the limbo: the server failed to start")
                 send(ids["disconnect"], encode_text(config["limbo_failed_kick_message"]))
-                await writer.drain()
+                await drain()
                 return
 
-            def text(key: str) -> str:
-                return apply_placeholders(str(config.get(key) or ""), config["server_dir"], server_mgr._start_time)
+            if fell.is_set():
+                # Fell out of the world: back to the spawn
+                fell.clear()
+                fell_task = asyncio.create_task(fell.wait())
+                teleports += 1
+                send(ids["pos"], build_position(protocol, limbo_spawn_point(config, world), teleports))
 
-            writer.write(build_title_packets(ids, text("limbo_title"), text("limbo_subtitle"), text("limbo_actionbar")))
-            if tick % 5 == 0:
-                send(ids["keepalive"], enc_i64(tick))
-            await writer.drain()
-            tick += 1
+            if loop.time() >= next_tick:
+                def text(key: str) -> str:
+                    return apply_placeholders(str(config.get(key) or ""), config["server_dir"], server_mgr._start_time)
 
-            try:
-                await asyncio.wait_for(server_mgr._ready_event.wait(), timeout=1)
-            except asyncio.TimeoutError:
-                pass
+                writer.write(build_title_packets(ids, text("limbo_title"), text("limbo_subtitle"),
+                                                 text("limbo_actionbar"), frame))
+
+                # Boss bar: added on the first tick, or when it is turned on by a config reload
+                bossbar = text("limbo_bossbar") if config.get("limbo_bossbar") else None
+                progress = limbo_startup_progress(config["server_dir"], server_mgr._start_time)
+                if bossbar is not None and not bossbar_shown:
+                    color = str(config.get("limbo_bossbar_color") or "yellow").strip().lower()
+                    if color not in LIMBO_BOSSBAR_COLORS:
+                        _limbo_warn_once(f"limbo_bossbar_color {color!r} is not one of {', '.join(LIMBO_BOSSBAR_COLORS)}; using yellow.")
+                    send(ids["boss"], build_bossbar_add(bossbar_id, bossbar, progress, color))
+                    bossbar_shown = True
+                elif bossbar is not None:
+                    send(ids["boss"], build_bossbar_title(bossbar_id, bossbar))
+                elif bossbar_shown:
+                    send(ids["boss"], bossbar_id.bytes + encode_varint(1))  # Remove
+                    bossbar_shown = False
+                if tick % 5 == 0:
+                    send(ids["keepalive"], enc_i64(tick))
+                tick += 1
+                next_tick += 1
+
+            if bossbar_shown and loop.time() >= next_bar:
+                send(ids["boss"], build_bossbar_progress(
+                    bossbar_id, limbo_startup_progress(config["server_dir"], server_mgr._start_time)))
+                next_bar += 0.05
+                if next_bar < loop.time():  # Skip ticks that were missed rather than catching up on them
+                    next_bar = loop.time() + 0.05
+            await drain()
+
+            # Sleep until the next update, or until the server is ready, the player falls or leaves
+            wake = min(next_tick, next_bar) if bossbar_shown else next_tick
+            await asyncio.wait({ready_task, watch_task, fell_task},
+                               timeout=max(0.0, wake - loop.time()),
+                               return_when=asyncio.FIRST_COMPLETED)
 
         # --- Hand over ---
-        if discard_task.done():
+        if watch_task.done():
             return
         log.info(f"Transferring {player_name} from the limbo to {target[0]}:{target[1]}")
         send(ids["transfer"], encode_string(target[0]) + encode_varint(target[1]))
-        await writer.drain()
+        await drain()
 
         # Give the client a moment to act on it before the connection is closed
         try:
-            await asyncio.wait_for(asyncio.shield(discard_task), timeout=3)
+            await asyncio.wait_for(asyncio.shield(watch_task), timeout=3)
         except asyncio.TimeoutError:
             pass
     finally:
-        discard_task.cancel()
+        watch_task.cancel()
+        ready_task.cancel()
+        if fell_task is not None:
+            fell_task.cancel()
 
 
 async def handle_connection(
@@ -2422,6 +3166,8 @@ async def watch_config(config: dict, path: str = CONFIG_FILENAME):
                 new_config.pop("listen_port", None)
                 config.update(new_config)
                 log.info("Config reloaded.")
+                _limbo_warned.clear()
+                asyncio.create_task(limbo_world_get(config))
             except Exception as e:
                 log.warning(f"Failed to reload config: {e}")
 
@@ -2438,12 +3184,17 @@ async def main():
 
     updater(config)
 
+    # The limbo world needs the block data file; fetch it if it is missing or outdated
+    if config.get("limbo_world") and not limbo_data_complete():
+        fetch_limbo_data(config)
+
     log.info(f"Proxy listening on {config['listen_host']}:{config['listen_port']}")
     log.info(f"Server (redirect) port: {config['server_port']}")
     log.info(f"Start command: {config['start_command']}")
     log.info(f"Auto-stop: after {config['auto_stop_empty_minutes']}m empty")
 
     asyncio.create_task(watch_config(config))
+    asyncio.create_task(limbo_world_get(config))  # Read the limbo world now, not when the first player joins
 
     server = await asyncio.start_server(
         lambda r, w: handle_connection(r, w, config, server_mgr),
