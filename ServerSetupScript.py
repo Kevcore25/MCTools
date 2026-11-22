@@ -58,13 +58,20 @@ def download():
         "fabric-api", # Library for mods
         "krypton", # Network optimizations
         "ferrite-core", # Memory optimizations
-        "noisium", # World generation optimizations
         "c2me-fabric", # Chunk performance improvements
         "scalablelux", # Light optimizations
         "vmp-fabric", # Improvements for higher player counts
         "alternate-current", # Redstone optimizations
         "threadtweak", # Reworks scheduling, which COULD be invasive and can be disabled for a more vanilla experience.
         "servercore", # Some optimizations like PaperMC mainly for SMPs. Can be disabled for a more vanilla experience.
+
+        "tt20", # Makes low TPS playable by "speeding" it up
+        "railoptimization" # Optimization for rails; not particularly useful but nice to have
+        # Reverie Projects for Worldgen optimizations
+        "zfastnoise", "zfastsurface", "zmaterial-rule-compiler",
+        "jasione", # GC improvements
+
+        "recipecooldown", # Fix recipe crashing bug
     ]
 
     for mod in MODS:
