@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-VERSION = '3.4'
+VERSION = '3.5'
 
 """
 Minecraft Adaptive Server Starter (MASS)!
@@ -22,7 +22,11 @@ pip install requests pyyaml cryptography google-auth google-auth-httplib2 google
 
 """
 Version updates:
-3.3:
+3.5:
+- Added authentication for joining
+- Added queuing system
+
+3.3 & 3.4:
 - Added the optional "limbo" join method for 1.20.5+
 - Transferred connections (handshake intent 3) are now accepted and passed to the server as normal logins
 - Backup options are expanded
@@ -67,6 +71,7 @@ import datetime
 import fcntl
 import fnmatch
 import gzip
+import hashlib
 import os
 import json
 import logging
@@ -84,6 +89,13 @@ import uuid as uuidlib
 import zlib
 from array import array
 from collections import Counter
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding, rsa
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+try:
+    from cryptography.hazmat.decrepit.ciphers.modes import CFB8
+except ImportError:  # Older cryptography versions
+    from cryptography.hazmat.primitives.ciphers.modes import CFB8
 
 log = logging.getLogger("ServerStarter")
 
@@ -185,9 +197,9 @@ join_method: kick
 
 # Text shown in the fake server. Updated every second.
 # Placeholders available: {{ESTIMATED_TIME_REMAINING}} and {{ESTIMATED_TIME}}.
-limbo_title: "§eThis server is waking up..."
-limbo_subtitle: "§bEstimated time remaining: {{ESTIMATED_TIME_REMAINING}}"
-limbo_actionbar: "§7You will join automatically once it is ready"
+limbo_title: ""
+limbo_subtitle: ""
+limbo_actionbar: "§7You will join automatically once it is ready ({{ESTIMATED_TIME_REMAINING}})"
 
 # Boss bar that fills up as the server starts, based on the average startup time.
 # Same placeholders as above. Set limbo_bossbar to null to hide it.
@@ -204,12 +216,10 @@ limbo_failed_kick_message: "§4The server failed to start.§r\\n\\nPlease try ag
 limbo_transfer_host: null
 limbo_transfer_port: null
 
-# A small world for players to explore while they wait (e.g. a parkour course).
+# A small world for players to explore while they wait
 # Path to a Sponge schematic (.schem) file, relative to server_dir. Set to null for an empty void.
-# Create one with WorldEdit or FAWE: select the build, //copy, then //schem save <name>.
 # The schematic's lowest corner is placed at 0, 0, 0. Players who fall off are returned to the spawn.
 # Requires the limbo-data.json.gz file next to this script (downloaded automatically if missing).
-# Not imported: sign text, container contents and entities. Doors and buttons do not work.
 limbo_world: null
 
 # Where players appear in the limbo world: [x, y, z] or [x, y, z, yaw, pitch].
@@ -238,9 +248,11 @@ auto_stop_poll_interval: 3
 # Set null to disable
 startup_timeout: 300
 
+# Seconds to hold players back after the server becomes reachable
+start_delay: 0
+
 # Amount of seconds to check if the server is online
 poll_interval: 0.5
-
 
 # -------------------------------------------------------------------------
 # Icons
@@ -292,6 +304,36 @@ ip_listing_no_response: false
 # - IPs already in usercache.json are still allowed (users who joined before)
 # - Any IP matching the whitelist always passes
 ip_listing_smartmode: true
+
+# -------------------------------------------------------------------------
+# Server whitelist / account verification
+# -------------------------------------------------------------------------
+# These apply while the server is asleep or starting (once it is up, it checks players itself).
+
+# If the server whitelist is on (white-list=true in server.properties), only players in
+# whitelist.json (or ops.json) can start the server or enter the limbo.
+enforce_whitelist: true
+whitelist_kick_message: "§cYou are not whitelisted on this server!"
+
+# If the server is in online mode (online-mode=true in server.properties), verify the
+# player's account with Mojang before they can start the server or enter the limbo.
+verify_accounts: true
+auth_failed_kick_message: "§cFailed to verify your Minecraft account.\\n\\nPlease restart your game and try again."
+
+# -------------------------------------------------------------------------
+# Queue
+# -------------------------------------------------------------------------
+# When the server is full, players wait in a queue. Operators (ops.json) go first,
+# ops with bypassesPlayerLimit skip the queue entirely.
+# With join_method limbo, queued players wait in the limbo and are transferred when a slot opens.
+# With join_method kick, they are kicked with their place in the queue. When it is their turn, a slot is held for them for queue_reserve_seconds; if they do not rejoin in time, the next player gets it.
+# Placeholders: {{QUEUE_POSITION}}, {{QUEUE_SIZE}}, {{QUEUE_RESERVE}}
+queue_enabled: true
+queue_reserve_seconds: 60 # Only for join_method: kick
+queue_kick_message: "§eThe server is full.§r\\n\\n§bYou are #{{QUEUE_POSITION}} of {{QUEUE_SIZE}} in the queue.\\n\\n§7Rejoin to check your place.\\nWhen it is your turn, you have {{QUEUE_RESERVE}}s to join."
+queue_limbo_title: "§eThe server is full"
+queue_limbo_subtitle: "§bYou are #{{QUEUE_POSITION}} of {{QUEUE_SIZE}} in the queue"
+queue_limbo_actionbar: "§7You will join automatically when a slot opens"
 
 # -------------------------------------------------------------------------
 # Automatic backups (Google Drive)
@@ -897,6 +939,8 @@ def load_config(path: str = CONFIG_FILENAME) -> dict:
     config["_rcon_enabled"] = False
     config["_rcon_port"] = 25575
     config["_rcon_password"] = ""
+    config["_whitelist_enabled"] = False
+    config["_online_mode"] = False
     props_path = Path(config["server_dir"]) / "server.properties"
     if props_path.exists():
         with open(props_path) as f:
@@ -910,8 +954,16 @@ def load_config(path: str = CONFIG_FILENAME) -> dict:
                     config["_rcon_password"] = line.split("=", 1)[1].strip()
                 elif line.startswith("level-name="):
                     config["_world_folder"] = line.split("=", 1)[1].strip()
+                elif line.startswith("white-list="):
+                    config["_whitelist_enabled"] = line.split("=", 1)[1].strip().lower() == "true"
+                elif line.startswith("online-mode="):
+                    config["_online_mode"] = line.split("=", 1)[1].strip().lower() == "true"
     if config["_rcon_enabled"]:
         log.info(f"RCON detected on port {config['_rcon_port']} (will use as stop fallback)")
+    if config["_whitelist_enabled"] and config.get("enforce_whitelist"):
+        log.info("Server whitelist is on: only whitelisted players can start the server.")
+    if config["_online_mode"] and config.get("verify_accounts"):
+        log.info("Server is in online mode: accounts are verified before starting the server.")
 
     # Auto-detect ram_required from -Xmx if set to -1
     if config.get("ram_required") == -1:
@@ -1239,6 +1291,7 @@ class ServerManager:
         self.backup_time = None
         self._playtime = 0
         self._player_join_at = None
+        self.queue: "PlayerQueue | None" = None
 
     def _acquire_start_lock(self) -> bool:
         """Try to acquire the cross-process startup lock. Returns True if held (or disabled)."""
@@ -1306,6 +1359,12 @@ class ServerManager:
             return None
         except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, Exception):
             return None
+
+    async def accepting_connections(self) -> bool:
+        """True if the server is up and the start_delay (if any) has elapsed."""
+        if self._starting and not self._ready_event.is_set():
+            return False
+        return await self.is_running()
 
     async def is_running(self) -> bool:
         """Check if the real Minecraft server is accepting connections."""
@@ -1568,6 +1627,10 @@ class ServerManager:
                     return
 
             if await self.is_running():
+                delay = float(self.config.get("start_delay") or 0)
+                if delay > 0:
+                    log.info(f"Server is reachable, delaying connections by {format_duration(delay)}...")
+                    await asyncio.sleep(delay)
                 # Record startup duration
                 if self._start_time is not None:
                     duration = time.monotonic() - self._start_time
@@ -1636,10 +1699,7 @@ class ServerManager:
 # =============================================================================
 # Limbo (fake waiting server)
 #
-# Used when join_method is "limbo". MASS completes an offline-style login itself,
-# puts the player in an empty world (or the limbo_world schematic), shows the time
-# remaining in the title and action bar, and transfers the player to the real
-# server once it is ready.
+# Used when join_method is "limbo"
 # Only Minecraft 1.20.5+ is supported, since older clients have no Transfer packet;
 # every other version gets the classic kick.
 # =============================================================================
@@ -1710,11 +1770,11 @@ LIMBO_CORE_PACKS: dict[int, tuple[str, ...]] = {
     777: ("26.3",),
 }
 
-LIMBO_WORLD = "minecraft:overworld"
+LIMBO_WORLD = "kmce:limbo"
 LIMBO_SPAWN_Y = 400     # Without a limbo_world: above the build limit, so no chunks need to be sent
 LIMBO_MIN_Y = -64       # Overworld height limits
 LIMBO_HEIGHT = 384
-LIMBO_VOID_Y = -100     # Players in a limbo_world who fall below this are returned to the spawn
+LIMBO_VOID_Y = -5     # Players in a limbo_world who fall below this are returned to the spawn
 LIMBO_MAX_SIZE = 512    # Largest schematic width and length, in blocks
 LIMBO_DRAIN_TIMEOUT = 30  # Seconds a client may take to receive what was sent before it is dropped
 LIMBO_COMPRESSION = 256  # Packet compression threshold, only used when a limbo_world is sent
@@ -2649,8 +2709,21 @@ async def run_limbo(
     target: tuple[str, int],
     config: dict,
     server_mgr: "ServerManager",
+    queue_entry: "QueueEntry | None" = None,
 ):
-    """Hold a player in the fake server until the real one is ready, then transfer them."""
+    """Hold a player in the fake server until the real one is ready, then transfer them.
+
+    With a queue_entry, the player is held until the queue lets them in instead.
+    """
+    try:
+        return await _run_limbo(reader, writer, protocol, player_name, player_uuid, target,
+                                config, server_mgr, queue_entry)
+    finally:
+        if queue_entry is not None and server_mgr.queue is not None:
+            server_mgr.queue.remove(queue_entry)
+
+
+async def _run_limbo(reader, writer, protocol, player_name, player_uuid, target, config, server_mgr, queue_entry):
     ids = LIMBO_PLAY_IDS[protocol]
 
     loaded = await limbo_world_get(config, protocol)
@@ -2719,7 +2792,8 @@ async def run_limbo(
     fell = asyncio.Event()
     watch_task = asyncio.create_task(
         _limbo_watch(reader, compressed, LIMBO_MOVE_IDS.get(protocol, ()) if world else (), fell))
-    ready_task = asyncio.create_task(server_mgr._ready_event.wait())
+    ready_event = queue_entry.admitted if queue_entry is not None else server_mgr._ready_event
+    ready_task = asyncio.create_task(ready_event.wait())
     fell_task = None
     try:
         tick = 0
@@ -2729,11 +2803,14 @@ async def run_limbo(
         bossbar_shown = False
         next_bar = next_tick  # The boss bar's progress is updated every game tick (1/20 s)
         fell_task = asyncio.create_task(fell.wait())
-        while not server_mgr._ready_event.is_set():
+        while not ready_event.is_set():
             if watch_task.done():
                 log.info(f"{player_name} left the limbo")
                 return
-            if not server_mgr._starting:
+            failed = (not server_mgr._starting) if queue_entry is None else (
+                not queue_entry.admitted.is_set() and server_mgr.queue is not None
+                and queue_entry not in server_mgr.queue.entries)
+            if failed:
                 # Startup was abandoned (e.g. startup_timeout reached)
                 log.info(f"Removing {player_name} from the limbo: the server failed to start")
                 send(ids["disconnect"], encode_text(config["limbo_failed_kick_message"]))
@@ -2749,25 +2826,35 @@ async def run_limbo(
 
             if loop.time() >= next_tick:
                 def text(key: str) -> str:
-                    return apply_placeholders(str(config.get(key) or ""), config["server_dir"], server_mgr._start_time)
+                    value = apply_placeholders(str(config.get(key) or ""), config["server_dir"], server_mgr._start_time)
+                    return apply_queue_placeholders(value, config, server_mgr.queue, queue_entry)
 
-                writer.write(build_title_packets(ids, text("limbo_title"), text("limbo_subtitle"),
-                                                 text("limbo_actionbar"), frame))
+                # Waiting for a slot on a running server, rather than for it to start
+                queued = queue_entry is not None and not server_mgr._starting
+                prefix = "queue_limbo" if queued else "limbo"
+                writer.write(build_title_packets(ids, text(f"{prefix}_title"), text(f"{prefix}_subtitle"),
+                                                 text(f"{prefix}_actionbar"), frame))
 
-                # Boss bar: added on the first tick, or when it is turned on by a config reload
-                bossbar = text("limbo_bossbar") if config.get("limbo_bossbar") else None
-                progress = limbo_startup_progress(config["server_dir"], server_mgr._start_time)
-                if bossbar is not None and not bossbar_shown:
-                    color = str(config.get("limbo_bossbar_color") or "yellow").strip().lower()
-                    if color not in LIMBO_BOSSBAR_COLORS:
-                        _limbo_warn_once(f"limbo_bossbar_color {color!r} is not one of {', '.join(LIMBO_BOSSBAR_COLORS)}; using yellow.")
-                    send(ids["boss"], build_bossbar_add(bossbar_id, bossbar, progress, color))
-                    bossbar_shown = True
-                elif bossbar is not None:
-                    send(ids["boss"], build_bossbar_title(bossbar_id, bossbar))
-                elif bossbar_shown:
-                    send(ids["boss"], bossbar_id.bytes + encode_varint(1))  # Remove
+                if not queued:
+                    # Boss bar: added on the first tick, or when it is turned on by a config reload
+                    bossbar = text("limbo_bossbar") if config.get("limbo_bossbar") else None
+                    progress = limbo_startup_progress(config["server_dir"], server_mgr._start_time)
+                    if bossbar is not None and not bossbar_shown:
+                        color = str(config.get("limbo_bossbar_color") or "yellow").strip().lower()
+                        if color not in LIMBO_BOSSBAR_COLORS:
+                            _limbo_warn_once(f"limbo_bossbar_color {color!r} is not one of {', '.join(LIMBO_BOSSBAR_COLORS)}; using yellow.")
+                        send(ids["boss"], build_bossbar_add(bossbar_id, bossbar, progress, color))
+                        bossbar_shown = True
+                    elif bossbar is not None:
+                        send(ids["boss"], build_bossbar_title(bossbar_id, bossbar))
+                    elif bossbar_shown:
+                        send(ids["boss"], bossbar_id.bytes + encode_varint(1))  # Remove
+                        bossbar_shown = False
+                else:
+                    # Remove bossbar
+                    send(ids["boss"], bossbar_id.bytes + encode_varint(1)) 
                     bossbar_shown = False
+
                 if tick % 5 == 0:
                     send(ids["keepalive"], enc_i64(tick))
                 tick += 1
@@ -2910,7 +2997,7 @@ async def handle_connection(
             pass
 
 async def handle_status(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, handshake_packet, config, server_mgr):
-    if await server_mgr.is_running():
+    if await server_mgr.accepting_connections():
         # Proxy the status request to the real server
         try:
             srv_reader, srv_writer = await asyncio.wait_for(
@@ -2979,6 +3066,348 @@ def save_verified_ips(ips: list[str]):
         json.dump(ips, f)
 
 verified_ips = load_verified_ips()
+
+# ----- Whitelist + account verification --------------------------------------
+
+def _load_player_list(config: dict, filename: str) -> list[dict]:
+    """Read whitelist.json / ops.json from the server directory."""
+    path = Path(config["server_dir"]) / filename
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        log.warning(f"Could not read {filename}: {e}")
+        return []
+
+
+def is_whitelisted(config: dict, name: str, player_uuid: uuidlib.UUID | None = None) -> bool:
+    """Whether a player is in whitelist.json or ops.json (operators bypass the whitelist).
+
+    Matches on the UUID when the account was verified, otherwise on the name.
+    """
+    for entry in _load_player_list(config, "whitelist.json") + _load_player_list(config, "ops.json"):
+        if player_uuid is not None:
+            try:
+                if uuidlib.UUID(str(entry.get("uuid"))) == player_uuid:
+                    return True
+            except ValueError:
+                continue
+        elif str(entry.get("name", "")).lower() == name.lower():
+            return True
+    return False
+
+
+_auth_keypair = None
+
+
+def auth_keypair():
+    """The RSA key used for login encryption (private key, public key as DER). Made on first use."""
+    global _auth_keypair
+    if _auth_keypair is None:
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        public_der = private_key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        _auth_keypair = (private_key, public_der)
+    return _auth_keypair
+
+
+def minecraft_hex_digest(*parts: bytes) -> str:
+    """Minecraft's server hash: SHA-1 read as a signed number, in hex."""
+    sha = hashlib.sha1()
+    for part in parts:
+        sha.update(part)
+    return format(int.from_bytes(sha.digest(), "big", signed=True), "x")
+
+
+class EncryptedReader:
+    """Decrypts what is read from a client after login encryption is turned on."""
+
+    def __init__(self, reader: asyncio.StreamReader, secret: bytes):
+        self._reader = reader
+        self._decryptor = Cipher(algorithms.AES(secret), CFB8(secret)).decryptor()
+
+    async def readexactly(self, n: int) -> bytes:
+        return self._decryptor.update(await self._reader.readexactly(n))
+
+
+class EncryptedWriter:
+    """Encrypts what is written to a client after login encryption is turned on."""
+
+    def __init__(self, writer: asyncio.StreamWriter, secret: bytes):
+        self._writer = writer
+        self._encryptor = Cipher(algorithms.AES(secret), CFB8(secret)).encryptor()
+
+    def write(self, data: bytes):
+        self._writer.write(self._encryptor.update(data))
+
+    async def drain(self):
+        await self._writer.drain()
+
+    def close(self):
+        self._writer.close()
+
+    async def wait_closed(self):
+        await self._writer.wait_closed()
+
+    def is_closing(self) -> bool:
+        return self._writer.is_closing()
+
+    def get_extra_info(self, name, default=None):
+        return self._writer.get_extra_info(name, default)
+
+    @property
+    def transport(self):
+        return self._writer.transport
+
+
+def _read_byte_array(data: bytes, offset: int) -> tuple[bytes, int]:
+    length, offset = decode_varint(data, offset)
+    if length < 0 or offset + length > len(data):
+        raise ValueError("bad byte array")
+    return data[offset : offset + length], offset + length
+
+
+async def authenticate_player(reader, writer, protocol: int, name: str):
+    """Run the login encryption handshake and check the session with Mojang.
+
+    Returns (result, writer). result is (reader, writer, uuid, name) with the streams now
+    encrypted, or None if the account could not be verified. The second value is the writer
+    to use for a kick message, since encryption may already be on when verification fails.
+    """
+    private_key, public_der = auth_keypair()
+    verify_token = os.urandom(4)
+    request = (
+        encode_string("")
+        + encode_varint(len(public_der)) + public_der
+        + encode_varint(len(verify_token)) + verify_token
+    )
+    if protocol >= 766:
+        request += b"\x01"  # Should authenticate
+    writer.write(make_packet(0x01, request))
+    await writer.drain()
+
+    try:
+        packet_id, data = await asyncio.wait_for(read_packet(reader), timeout=10)
+        if packet_id != 0x01:
+            return None, writer
+        encrypted_secret, offset = _read_byte_array(data, 0)
+        encrypted_token = None
+        if protocol in (759, 760):
+            # 1.19 - 1.19.2 can answer with a signature in place of the verify token
+            has_token = data[offset] != 0
+            offset += 1
+            if has_token:
+                encrypted_token, offset = _read_byte_array(data, offset)
+        else:
+            encrypted_token, offset = _read_byte_array(data, offset)
+
+        secret = private_key.decrypt(encrypted_secret, rsa_padding.PKCS1v15())
+        if len(secret) != 16:
+            return None, writer
+        if encrypted_token is not None and private_key.decrypt(encrypted_token, rsa_padding.PKCS1v15()) != verify_token:
+            return None, writer
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, IndexError):
+        return None, writer
+
+    # Everything after the Encryption Response is encrypted
+    reader = EncryptedReader(reader, secret)
+    writer = EncryptedWriter(writer, secret)
+
+    server_hash = minecraft_hex_digest(b"", secret, public_der)
+    try:
+        r = await asyncio.to_thread(
+            requests.get,
+            "https://sessionserver.mojang.com/session/minecraft/hasJoined",
+            params={"username": name, "serverId": server_hash},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return None, writer
+        profile = r.json()
+        return (reader, writer, uuidlib.UUID(profile["id"]), str(profile["name"])), writer
+    except (requests.RequestException, ValueError, KeyError) as e:
+        log.warning(f"Could not verify {name}'s account: {e}")
+        return None, writer
+
+
+# ----- Queue -------------------------------------------------------------------
+
+QUEUE_IN_FLIGHT_SECONDS = 30  # A player just let in counts as using a slot until the server lists them
+
+
+def op_info(config: dict, name: str, player_uuid: uuidlib.UUID | None = None) -> tuple[int, bool]:
+    """(op level, bypassesPlayerLimit) from ops.json; (0, False) for non-operators."""
+    for entry in _load_player_list(config, "ops.json"):
+        matched = False
+        if player_uuid is not None:
+            try:
+                matched = uuidlib.UUID(str(entry.get("uuid"))) == player_uuid
+            except ValueError:
+                pass
+        if not matched:
+            matched = str(entry.get("name", "")).lower() == name.lower()
+        if matched:
+            try:
+                level = int(entry.get("level", 4))
+            except (TypeError, ValueError):
+                level = 4
+            return level, bool(entry.get("bypassesPlayerLimit", False))
+    return 0, False
+
+
+class QueueEntry:
+    def __init__(self, name: str, player_uuid: uuidlib.UUID | None, priority: int, limbo: bool):
+        self.name = name
+        self.uuid = player_uuid
+        self.priority = priority
+        self.limbo = limbo
+        self.joined_at = time.monotonic()
+        self.admitted = asyncio.Event()       # Limbo players: set when they may be transferred
+        self.reserved_until: float | None = None  # Kick players: time a held slot runs out
+
+    def sort_key(self):
+        return (-self.priority, self.joined_at)
+
+
+class PlayerQueue:
+    """Players waiting for a free slot on a full server."""
+
+    def __init__(self, server_mgr: "ServerManager"):
+        self.server_mgr = server_mgr
+        self.entries: list[QueueEntry] = []
+        self.in_flight: dict[str, float] = {}  # Lowercase name -> time they were let in
+        self._lock = asyncio.Lock()
+
+    @property
+    def config(self) -> dict:
+        return self.server_mgr.config
+
+    def ordered(self) -> list[QueueEntry]:
+        return sorted(self.entries, key=QueueEntry.sort_key)
+
+    def find(self, name: str) -> QueueEntry | None:
+        for entry in self.entries:
+            if entry.name.lower() == name.lower():
+                return entry
+        return None
+
+    def add(self, name: str, player_uuid: uuidlib.UUID | None, priority: int, limbo: bool) -> QueueEntry:
+        entry = self.find(name)
+        if entry is None:
+            entry = QueueEntry(name, player_uuid, priority, limbo)
+            self.entries.append(entry)
+            log.info(f"{name} joined the queue (#{self.position(entry)} of {len(self.entries)})")
+        else:
+            entry.priority, entry.limbo = priority, limbo
+            if player_uuid is not None:
+                entry.uuid = player_uuid
+        return entry
+
+    def remove(self, entry: QueueEntry):
+        if entry in self.entries:
+            self.entries.remove(entry)
+
+    def position(self, entry: QueueEntry) -> int:
+        try:
+            return self.ordered().index(entry) + 1
+        except ValueError:
+            return 0
+
+    def let_in(self, name: str, entry: QueueEntry | None = None):
+        """Count a login that was let through as using a slot."""
+        self.in_flight[name.lower()] = time.monotonic()
+        if entry is not None:
+            self.remove(entry)
+
+    def was_let_in(self, name: str) -> bool:
+        """Whether the player was just let in (e.g. is reconnecting after a limbo transfer)."""
+        t = self.in_flight.get(name.lower())
+        return t is not None and time.monotonic() - t < QUEUE_IN_FLIGHT_SECONDS
+
+    def _free_slots(self, status: dict, now: float) -> int | None:
+        try:
+            online = int(status["players"]["online"])
+            maximum = int(status["players"]["max"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        # Players the server already lists are counted in "online"
+        listed = {str(p.get("name", "")).lower() for p in status["players"].get("sample") or [] if isinstance(p, dict)}
+        self.in_flight = {n: t for n, t in self.in_flight.items()
+                          if now - t < QUEUE_IN_FLIGHT_SECONDS and n not in listed}
+        reserved = sum(1 for e in self.entries if e.reserved_until is not None)
+        return maximum - online - len(self.in_flight) - reserved
+
+    async def has_room(self) -> bool:
+        """Whether a player not in the queue may go straight in."""
+        async with self._lock:
+            status = await self.server_mgr.status_ping()
+            if status is None:
+                return True
+            free = self._free_slots(status, time.monotonic())
+            if free is None:
+                return True
+            waiting = sum(1 for e in self.entries if e.reserved_until is None)
+            return free > waiting
+
+    async def admit(self):
+        """Hand free slots to the players at the front of the queue."""
+        async with self._lock:
+            now = time.monotonic()
+            for entry in list(self.entries):
+                if entry.reserved_until is not None and now >= entry.reserved_until:
+                    log.info(f"{entry.name} did not rejoin in time; giving the slot to the next player")
+                    self.remove(entry)
+            if not self.entries or not await self.server_mgr.accepting_connections():
+                return
+            status = await self.server_mgr.status_ping()
+            if status is None:
+                return
+            free = self._free_slots(status, now)
+            if free is None:
+                return
+            for entry in self.ordered():
+                if free <= 0:
+                    break
+                if entry.reserved_until is not None:
+                    continue
+                if entry.limbo:
+                    log.info(f"Letting {entry.name} in from the queue")
+                    entry.admitted.set()
+                    self.let_in(entry.name, entry)
+                else:
+                    reserve = float(self.config.get("queue_reserve_seconds") or 60)
+                    log.info(f"Holding a slot for {entry.name} for {format_duration(reserve)}")
+                    entry.reserved_until = now + reserve
+                free -= 1
+
+    async def monitor(self):
+        while True:
+            await asyncio.sleep(max(0.5, float(self.config.get("poll_interval") or 1)))
+            if not self.entries:
+                continue
+            mgr = self.server_mgr
+            if not mgr._starting and not await mgr.is_running():
+                # The server is off (stopped or failed to start): the queue is over
+                self.entries.clear()
+                continue
+            try:
+                await self.admit()
+            except Exception as e:
+                log.warning(f"Queue update failed: {e}")
+
+
+def apply_queue_placeholders(text: str, config: dict, queue: "PlayerQueue | None", entry: QueueEntry | None) -> str:
+    position = queue.position(entry) if queue and entry else 0
+    size = len(queue.entries) if queue else 0
+    reserve = int(float(config.get("queue_reserve_seconds") or 60))
+    return (text.replace("{{QUEUE_POSITION}}", str(position))
+                .replace("{{QUEUE_SIZE}}", str(size))
+                .replace("{{QUEUE_RESERVE}}", str(reserve)))
+
 
 async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, handshake_packet, protocol_version, config, server_mgr: ServerManager, addr, smdata, citydata, client_host: str | None = None, client_port: int | None = None):
     global backup_time
@@ -3057,9 +3486,28 @@ async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         log.error(f"IP listing exception: {e}")
 
     # Proxy/redirect if it is already running
-    if await server_mgr.is_running():
-        return await proxy_to_server(reader, writer, handshake_packet, login_start_packet, config)
-        
+    queue = server_mgr.queue if config.get("queue_enabled") else None
+    if await server_mgr.accepting_connections():
+        if queue is None:
+            return await proxy_to_server(reader, writer, handshake_packet, login_start_packet, config)
+        return await queue_or_proxy(reader, writer, handshake_packet, login_start_packet, login_data,
+                                    protocol_version, player_name, config, server_mgr, queue,
+                                    client_host, client_port)
+
+    # Verify the account (online mode) and the whitelist before anything can be started
+    verified_uuid = None
+    if config.get("_online_mode") and config.get("verify_accounts"):
+        result, writer = await authenticate_player(reader, writer, protocol_version, player_name)
+        if result is None:
+            log.info(f"Denied {player_name}: account could not be verified")
+            return await send_disconnect_login(writer, config["auth_failed_kick_message"])
+        reader, writer, verified_uuid, player_name = result
+
+    if config.get("_whitelist_enabled") and config.get("enforce_whitelist"):
+        if not is_whitelisted(config, player_name, verified_uuid):
+            log.info(f"Denied {player_name}: not whitelisted")
+            return await send_disconnect_login(writer, config["whitelist_kick_message"])
+
     # Check RAM
     ram = psutil.virtual_memory().available /  (1024 ** 3)
     swap = psutil.swap_memory().free /  (1024 ** 3)
@@ -3087,14 +3535,84 @@ async def handle_login(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             # Limbo join method: wait in a fake server instead of being kicked
             if status in ("started", "starting") and limbo_supported(config, protocol_version):
                 target = limbo_transfer_target(config, client_host, client_port)
-                player_uuid = parse_login_start_uuid(login_data)
+                player_uuid = verified_uuid or parse_login_start_uuid(login_data)
                 if target is None:
                     log.warning(f"Cannot work out an address to transfer {player_name} to ({client_host!r}); set limbo_transfer_host. Kicking instead.")
                 elif player_uuid is not None:
-                    return await run_limbo(reader, writer, protocol_version, player_name, player_uuid, target, config, server_mgr)
+                    entry = None
+                    if queue is not None:
+                        level, _bypass = op_info(config, player_name, player_uuid)
+                        entry = queue.add(player_name, player_uuid, level, limbo=True)
+                    return await run_limbo(reader, writer, protocol_version, player_name, player_uuid, target,
+                                           config, server_mgr, queue_entry=entry)
 
             kick_msg = apply_placeholders(config["kick_message"], config["server_dir"], server_mgr._start_time)
     await send_disconnect_login(writer, kick_msg)
+
+
+async def queue_or_proxy(reader, writer, handshake_packet, login_start_packet, login_data, protocol_version,
+                         player_name, config, server_mgr: "ServerManager", queue: "PlayerQueue",
+                         client_host, client_port):
+    """The server is up: let the player in if there is room, otherwise queue them."""
+    login_uuid = parse_login_start_uuid(login_data)
+    level, bypass = op_info(config, player_name, login_uuid)
+    entry = queue.find(player_name)
+
+    def proxy(entry_to_clear=None):
+        queue.let_in(player_name, entry_to_clear)
+        return proxy_to_server(reader, writer, handshake_packet, login_start_packet, config)
+
+    if queue.was_let_in(player_name):
+        # Reconnecting after being let in (limbo transfer); their slot is already counted
+        return await proxy_to_server(reader, writer, handshake_packet, login_start_packet, config)
+    if bypass:
+        return await proxy(entry)
+    if entry is not None and entry.reserved_until is not None:
+        log.info(f"{player_name} rejoined in time and takes their held slot")
+        return await proxy(entry)
+    if entry is None and await queue.has_room():
+        return await proxy()
+
+    # The server is full: queue the player
+    use_limbo = limbo_supported(config, protocol_version)
+    target = limbo_transfer_target(config, client_host, client_port) if use_limbo else None
+    if use_limbo and target is None:
+        log.warning(f"Cannot work out an address to transfer {player_name} to ({client_host!r}); set limbo_transfer_host. Kicking instead.")
+        use_limbo = False
+
+    if not use_limbo:
+        # Kick method: not encrypted here, as the player may be proxied straight to the server
+        if config.get("_whitelist_enabled") and config.get("enforce_whitelist") and not is_whitelisted(config, player_name):
+            log.info(f"Denied {player_name}: not whitelisted")
+            return await send_disconnect_login(writer, config["whitelist_kick_message"])
+        entry = queue.add(player_name, login_uuid, level, limbo=False)
+        await queue.admit()
+        if entry.reserved_until is not None:
+            return await proxy(entry)
+        return await send_disconnect_login(writer, apply_queue_placeholders(
+            str(config.get("queue_kick_message") or "The server is full."), config, queue, entry))
+
+    # Limbo method: verify the account, as the queue order depends on who the player is
+    player_uuid = login_uuid
+    if config.get("_online_mode") and config.get("verify_accounts"):
+        result, writer = await authenticate_player(reader, writer, protocol_version, player_name)
+        if result is None:
+            log.info(f"Denied {player_name}: account could not be verified")
+            return await send_disconnect_login(writer, config["auth_failed_kick_message"])
+        reader, writer, player_uuid, player_name = result
+        level, bypass = op_info(config, player_name, player_uuid)
+    if config.get("_whitelist_enabled") and config.get("enforce_whitelist"):
+        if not is_whitelisted(config, player_name, player_uuid if player_uuid != login_uuid else None):
+            log.info(f"Denied {player_name}: not whitelisted")
+            return await send_disconnect_login(writer, config["whitelist_kick_message"])
+    if player_uuid is None:
+        return await send_disconnect_login(writer, apply_queue_placeholders(
+            str(config.get("queue_kick_message") or "The server is full."), config, queue, None))
+
+    entry = queue.add(player_name, player_uuid, level, limbo=True)
+    await queue.admit()
+    return await run_limbo(reader, writer, protocol_version, player_name, player_uuid, target,
+                           config, server_mgr, queue_entry=entry)
 
 
 async def send_disconnect_login(writer: asyncio.StreamWriter, message: str):
@@ -3171,7 +3689,6 @@ async def watch_config(config: dict, path: str = CONFIG_FILENAME):
             except Exception as e:
                 log.warning(f"Failed to reload config: {e}")
 
-
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -3181,6 +3698,7 @@ async def main():
 
     config = load_config()
     server_mgr = ServerManager(config)
+    server_mgr.queue = PlayerQueue(server_mgr)
 
     updater(config)
 
@@ -3194,6 +3712,7 @@ async def main():
     log.info(f"Auto-stop: after {config['auto_stop_empty_minutes']}m empty")
 
     asyncio.create_task(watch_config(config))
+    asyncio.create_task(server_mgr.queue.monitor())
     asyncio.create_task(limbo_world_get(config))  # Read the limbo world now, not when the first player joins
 
     server = await asyncio.start_server(
