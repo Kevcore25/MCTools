@@ -55,6 +55,8 @@ MODS = [
     # Reverie Projects for Worldgen optimizations
     "zconfig", "zfastnoise", "zfastsurface", "zmaterial-rule-compiler",
     "jasione", # GC improvements
+    
+    "no-chat-reports",
 
     "recipecooldown", # Fix recipe crashing bug
 
